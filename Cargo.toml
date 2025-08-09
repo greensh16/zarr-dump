@@ -1,0 +1,38 @@
+[package]
+name = "zarr-dump"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sam Green"]
+description = "A command-line tool for inspecting and summarizing Zarr store metadata in NetCDF-style format"
+license = "MIT"
+repository = "https://github.com/green/zarr_summery"
+homepage = "https://github.com/green/zarr_summery"
+readme = "README.md"
+keywords = ["zarr", "netcdf", "metadata", "cli", "data"]
+categories = ["command-line-utilities", "science", "filesystem"]
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+]
+
+[[bin]]
+name = "zarr-dump"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+zarrs = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+colored = "2.0"
+tokio = { version = "1", features = ["full"] }
+byteorder = "1.5"
+
+[dev-dependencies]
+tempfile = "3.0"
