@@ -13,7 +13,7 @@ fn create_sample_store(temp_dir: &Path) -> std::io::Result<()> {
     let zattrs_content = r#"{
         "title": "Sample Climate Dataset",
         "institution": "Test University",
-        "source": "zarr_summery integration test",
+        "source": "zarr-dump integration test",
         "history": "Created for testing"
     }"#;
     fs::write(temp_dir.join(".zattrs"), zattrs_content)?;
@@ -138,11 +138,11 @@ fn test_cli_with_hierarchical_store() {
     create_sample_store(store_path).expect("Failed to create sample store");
 
     // Run the binary
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .arg("--no-color")
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     // Check that the command succeeded
     assert!(
@@ -245,11 +245,11 @@ fn test_cli_with_consolidated_store() {
     create_consolidated_store(store_path).expect("Failed to create consolidated store");
 
     // Run the binary
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .arg("--no-color")
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     // Check that the command succeeded
     assert!(
@@ -285,10 +285,10 @@ fn test_cli_with_consolidated_store() {
 
 #[test]
 fn test_cli_with_nonexistent_path() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg("/nonexistent/path")
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     // Should fail with non-zero exit code
     assert!(!output.status.success());
@@ -308,10 +308,10 @@ fn test_cli_with_invalid_zarr_store() {
     // Create an empty directory (not a valid Zarr store)
     // No .zarray, .zgroup, or .zmetadata files
 
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     // Should fail with non-zero exit code
     assert!(!output.status.success());
@@ -331,10 +331,10 @@ fn test_cli_color_output() {
     create_sample_store(store_path).expect("Failed to create sample store");
 
     // Run without --no-color flag
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     assert!(output.status.success());
 
@@ -355,11 +355,11 @@ fn test_cli_no_color_output() {
     create_sample_store(store_path).expect("Failed to create sample store");
 
     // Run with --no-color flag
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .arg("--no-color")
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     assert!(output.status.success());
 
@@ -379,11 +379,11 @@ fn test_cli_variable_attributes() {
 
     create_sample_store(store_path).expect("Failed to create sample store");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .arg("--no-color")
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     assert!(output.status.success());
 
@@ -457,11 +457,11 @@ fn test_dimension_inference_integration() {
     fs::write(store_path.join("var2").join(".zattrs"), var2_zattrs)
         .expect("Failed to write var2 .zattrs");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_zarr_summery"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg(store_path.to_str().unwrap())
         .arg("--no-color")
         .output()
-        .expect("Failed to execute zarr_summery");
+        .expect("Failed to execute zarr-dump");
 
     assert!(output.status.success());
 
