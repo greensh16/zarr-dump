@@ -471,6 +471,18 @@ mod tests {
         let json_str = serde_json::to_string(&string_val).unwrap();
         assert!(json_str.contains("test"));
 
+        let json_str = serde_json::to_string(&number_val).unwrap();
+        assert!(json_str.contains("3.14"));
+
+        let json_str = serde_json::to_string(&int_val).unwrap();
+        assert!(json_str.contains("42"));
+
+        let json_str = serde_json::to_string(&bool_val).unwrap();
+        assert!(json_str.contains("true"));
+
+        let json_str = serde_json::to_string(&null_val).unwrap();
+        assert_eq!(json_str, "null");
+
         let json_str = serde_json::to_string(&array_val).unwrap();
         assert!(json_str.contains("1"));
 

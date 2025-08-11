@@ -13,28 +13,22 @@ A command-line tool for inspecting and summarizing Zarr store metadata, displayi
 
 ## Installation
 
-```bash
-cargo install --path .
-```
-
-Or build from source:
+Build from source:
 
 ```bash
 git clone <repository-url>
-cd zarr_summery
+cd zarr-dump
 cargo build --release
 ```
-
-## Usage
 
 ### Basic Usage
 
 ```bash
 # Inspect a Zarr store
-zarr_summery /path/to/zarr/store
+zarr-dump /path/to/zarr/store
 
 # Disable colored output
-zarr_summery /path/to/zarr/store --no-color
+zarr-dump /path/to/zarr/store --no-color
 ```
 
 ### Example: Climate Data with Hierarchical Metadata
@@ -42,7 +36,7 @@ zarr_summery /path/to/zarr/store --no-color
 For a typical climate dataset with temperature and pressure arrays:
 
 ```bash
-zarr_summery ./climate_data/
+zarr-dump ./climate_data/
 ```
 
 Output:
@@ -87,7 +81,7 @@ variables:
 For stores with consolidated metadata (faster loading):
 
 ```bash
-zarr_summery ./consolidated_data/
+zarr-dump ./consolidated_data/
 ```
 
 Output:
@@ -120,12 +114,14 @@ variables:
 ### Unlimited Dimensions
 
 The tool automatically detects unlimited dimensions by:
+
 1. Finding dimensions that appear with different sizes across multiple arrays
 2. Identifying dimensions with size 0 (common for record/time dimensions)
 
 ## Supported Zarr Features
 
-### ✅ Supported
+### Supported
+
 - Zarr v2 specification
 - Consolidated metadata (`.zmetadata`)
 - Hierarchical metadata (`.zarray`, `.zattrs`, `.zgroup`)
@@ -135,13 +131,15 @@ The tool automatically detects unlimited dimensions by:
 - Dimension inference via `_ARRAY_DIMENSIONS`
 - Nested groups
 
-### ❌ Current Limitations
+### Current Limitations
+
 - **Zarr v3**: Only Zarr v2 is currently supported
 - **Remote Stores**: Only local filesystem stores (no S3, HTTP, etc.)
 - **Large Arrays**: No data inspection, metadata only
 - **Complex Dtypes**: Basic support for structured dtypes
 
-### 📋 Recommendations
+### Recommendations
+
 - **Use Consolidated Metadata**: For best performance, create consolidated metadata with `zarr.convenience.consolidate_metadata()`
 - **CF Conventions**: Include `_ARRAY_DIMENSIONS` attributes for proper dimension naming
 
@@ -183,6 +181,7 @@ See `tests/cli.rs` for examples of creating test Zarr stores programmatically.
 ## Contributing
 
 Contributions welcome! Areas for improvement:
+
 - Zarr v3 support
 - Remote store support (S3, HTTP)
 - Performance optimizations

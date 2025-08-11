@@ -1,5 +1,5 @@
 use anyhow::Result;
-use zarr_summery::ZarrStore;
+use zarr_dump::ZarrStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
