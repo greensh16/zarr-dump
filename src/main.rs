@@ -11,7 +11,7 @@ use store::ZarrStore;
 #[derive(Parser)]
 #[command(name = "zarr-dump")]
 #[command(version)]
-#[command(about = "A tool for summarizing Zarr stores")]
+#[command(about = "A command-line tool for inspecting and summarizing Zarr store metadata in NetCDF-style format")]
 struct Args {
     /// Path to the Zarr store root directory
     path: PathBuf,

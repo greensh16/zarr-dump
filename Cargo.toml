@@ -1,6 +1,6 @@
 [package]
 name = "zarr-dump"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 authors = ["Sam Green"]
 description = "A command-line tool for inspecting and summarizing Zarr store metadata in NetCDF-style format"

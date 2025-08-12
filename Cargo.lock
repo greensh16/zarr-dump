@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "zarr-dump"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "byteorder",
