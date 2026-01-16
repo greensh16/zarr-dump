@@ -185,9 +185,23 @@ impl ZarrMetadata {
         }
     }
 
-    /// Extract dimension names from _ARRAY_DIMENSIONS attribute or generate defaults
+    /// Extract dimension names from _ARRAY_DIMENSIONS attribute, dimension_names, or generate defaults
     pub fn extract_dimension_names(&self, variable: &Variable) -> Vec<String> {
-        // Look for _ARRAY_DIMENSIONS in variable attributes
+        // First check for v3 dimension_names in attributes (as an array of strings)
+        if let Some(AttributeValue::Array(dims)) = variable.attributes.get("dimension_names") {
+            let names: Vec<String> = dims
+                .iter()
+                .filter_map(|val| match val {
+                    AttributeValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !names.is_empty() {
+                return names;
+            }
+        }
+
+        // Then look for v2 _ARRAY_DIMENSIONS in variable attributes
         if let Some(AttributeValue::Array(dims)) = variable.attributes.get("_ARRAY_DIMENSIONS") {
             dims.iter()
                 .filter_map(|val| match val {
@@ -231,6 +245,65 @@ pub struct ZGroupMetadata {
 pub struct ConsolidatedMetadata {
     pub zarr_consolidated_format: u8,
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Zarr v3 root metadata from zarr.json file
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ZarrV3Root {
+    pub zarr_format: u8,
+    pub node_type: String,
+    pub attributes: Option<HashMap<String, AttributeValue>>,
+    pub consolidated_metadata: Option<ZarrV3ConsolidatedMetadata>,
+}
+
+/// Zarr v3 consolidated metadata
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ZarrV3ConsolidatedMetadata {
+    pub kind: String,
+    pub must_understand: bool,
+    pub metadata: HashMap<String, ZarrV3ArrayMetadata>,
+}
+
+/// Zarr v3 array metadata from zarr.json file
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct ZarrV3ArrayMetadata {
+    pub zarr_format: u8,
+    pub node_type: String,
+    pub shape: Vec<u64>,
+    pub data_type: String,
+    pub chunk_grid: ZarrV3ChunkGrid,
+    pub chunk_key_encoding: serde_json::Value,
+    pub fill_value: serde_json::Value,
+    pub codecs: Vec<ZarrV3Codec>,
+    pub attributes: Option<HashMap<String, AttributeValue>>,
+    pub dimension_names: Option<Vec<String>>,
+    pub storage_transformers: Option<Vec<serde_json::Value>>,
+}
+
+/// Zarr v3 chunk grid configuration
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct ZarrV3ChunkGrid {
+    pub name: String,
+    pub configuration: ZarrV3ChunkGridConfig,
+}
+
+/// Zarr v3 chunk grid configuration
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct ZarrV3ChunkGridConfig {
+    pub chunk_shape: Vec<u64>,
+}
+
+/// Zarr v3 codec configuration
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct ZarrV3Codec {
+    pub name: String,
+    pub configuration: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

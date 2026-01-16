@@ -31,7 +31,13 @@ impl ZarrStore {
 
     /// Load metadata from the Zarr store, attempting consolidated read first
     pub async fn load_metadata(&self) -> Result<ZarrMetadata> {
-        // Try consolidated metadata first
+        // First check if this is a Zarr v3 store by looking for zarr.json
+        let zarr_json_path = self.path.join("zarr.json");
+        if zarr_json_path.exists() {
+            return self.load_v3_metadata().await;
+        }
+
+        // Try consolidated metadata first (v2)
         match self.load_consolidated_metadata().await {
             Ok(metadata) => {
                 println!("Loaded consolidated metadata from .zmetadata");
@@ -737,5 +743,179 @@ impl ZarrStore {
         }
 
         Ok(data)
+    }
+
+    /// Load Zarr v3 metadata from zarr.json
+    async fn load_v3_metadata(&self) -> Result<ZarrMetadata> {
+        use crate::metadata::ZarrV3Root;
+
+        let zarr_json_path = self.path.join("zarr.json");
+        let data = fs::read(&zarr_json_path).with_context(|| {
+            format!("Failed to read zarr.json at '{}'", zarr_json_path.display())
+        })?;
+
+        let v3_root: ZarrV3Root =
+            serde_json::from_slice(&data).with_context(|| "Failed to parse zarr.json")?;
+
+        let mut metadata = ZarrMetadata::new();
+        metadata.zarr_format = 3;
+
+        // Handle root attributes
+        if let Some(attrs) = v3_root.attributes {
+            metadata.global_attributes = attrs.clone();
+            metadata.root_group.attributes = attrs;
+        }
+
+        // Check for consolidated metadata first
+        if let Some(consolidated) = v3_root.consolidated_metadata {
+            println!("Loaded consolidated metadata from zarr.json (Zarr v3)");
+            for (name, v3_array) in consolidated.metadata {
+                self.convert_v3_array_to_variable(&mut metadata, &name, v3_array)?;
+            }
+        } else {
+            // Fall back to hierarchical scanning for v3
+            println!("Scanning for individual zarr.json files (Zarr v3)...");
+            self.scan_v3_directory(&mut metadata, "", &self.path)?;
+        }
+
+        // Infer dimensions
+        metadata.infer_dimensions();
+
+        Ok(metadata)
+    }
+
+    /// Recursively scan directory for Zarr v3 zarr.json files
+    fn scan_v3_directory(
+        &self,
+        metadata: &mut ZarrMetadata,
+        current_path: &str,
+        fs_path: &Path,
+    ) -> Result<()> {
+        use crate::metadata::ZarrV3ArrayMetadata;
+
+        let entries = std::fs::read_dir(fs_path)
+            .context(format!("Failed to read directory: {}", fs_path.display()))?;
+
+        for entry in entries.flatten() {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            let entry_path = entry.path();
+
+            // Skip hidden files and chunk data directories
+            if filename.starts_with('.') || filename == "c" {
+                continue;
+            }
+
+            if entry_path.is_dir() {
+                let zarr_json = entry_path.join("zarr.json");
+                if zarr_json.exists() {
+                    // Read and parse the zarr.json
+                    let data = fs::read(&zarr_json)?;
+                    let v3_array: ZarrV3ArrayMetadata = serde_json::from_slice(&data).context(
+                        format!("Failed to parse zarr.json at {}", zarr_json.display()),
+                    )?;
+
+                    let var_path = if current_path.is_empty() {
+                        filename.clone()
+                    } else {
+                        format!("{}/{}", current_path, filename)
+                    };
+
+                    self.convert_v3_array_to_variable(metadata, &var_path, v3_array)?;
+                }
+
+                // Recursively scan subdirectories
+                let child_path = if current_path.is_empty() {
+                    filename
+                } else {
+                    format!("{}/{}", current_path, filename)
+                };
+                self.scan_v3_directory(metadata, &child_path, &entry_path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert Zarr v3 array metadata to internal Variable structure
+    fn convert_v3_array_to_variable(
+        &self,
+        metadata: &mut ZarrMetadata,
+        path: &str,
+        v3_array: crate::metadata::ZarrV3ArrayMetadata,
+    ) -> Result<()> {
+        let variable_name = path.split('/').next_back().unwrap_or(path).to_string();
+
+        // Convert v3 data_type to v2 dtype format
+        let dtype = self.convert_v3_datatype_to_v2(&v3_array.data_type);
+
+        // Extract chunks from chunk_grid
+        let chunks = v3_array.chunk_grid.configuration.chunk_shape.clone();
+
+        // Extract codec names
+        let codecs: Vec<String> = v3_array.codecs.iter().map(|c| c.name.clone()).collect();
+
+        // Determine primary compressor (skip 'bytes' codec which is just endianness)
+        let compressor = codecs.iter().find(|c| *c != "bytes").cloned();
+
+        // Prepare attributes - merge v3 attributes with dimension_names
+        let mut attributes = v3_array.attributes.clone().unwrap_or_default();
+
+        // Add dimension_names as an attribute for easier processing
+        if let Some(ref dim_names) = v3_array.dimension_names {
+            let dim_values: Vec<AttributeValue> = dim_names
+                .iter()
+                .map(|s| AttributeValue::String(s.clone()))
+                .collect();
+            attributes.insert(
+                "dimension_names".to_string(),
+                AttributeValue::Array(dim_values),
+            );
+        }
+
+        let dimensions = v3_array
+            .shape
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Dimension {
+                name: format!("dim_{}", i),
+                size,
+                is_unlimited: false,
+            })
+            .collect();
+
+        let variable = Variable {
+            name: variable_name,
+            path: path.to_string(),
+            dtype,
+            shape: v3_array.shape,
+            chunks,
+            compressor,
+            fill_value: Some(AttributeValue::String("NaN".to_string())), // Simplified
+            order: "C".to_string(),
+            filters: vec![],
+            attributes,
+            dimensions,
+        };
+
+        metadata.variables.insert(path.to_string(), variable);
+        Ok(())
+    }
+
+    /// Convert Zarr v3 data_type to v2 dtype format
+    fn convert_v3_datatype_to_v2(&self, data_type: &str) -> String {
+        match data_type {
+            "float32" => "<f4".to_string(),
+            "float64" => "<f8".to_string(),
+            "int8" => "<i1".to_string(),
+            "int16" => "<i2".to_string(),
+            "int32" => "<i4".to_string(),
+            "int64" => "<i8".to_string(),
+            "uint8" => "<u1".to_string(),
+            "uint16" => "<u2".to_string(),
+            "uint32" => "<u4".to_string(),
+            "uint64" => "<u8".to_string(),
+            "bool" => "?".to_string(),
+            other => other.to_string(), // Pass through unknown types
+        }
     }
 }

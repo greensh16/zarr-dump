@@ -5,8 +5,9 @@ A command-line tool for inspecting and summarizing Zarr store metadata, displayi
 ## Features
 
 - **NetCDF-Style Output**: Displays Zarr metadata in the familiar `ncdump -h` format
-- **Consolidated Metadata Support**: Efficiently reads `.zmetadata` files when available
-- **Hierarchical Fallback**: Gracefully falls back to scanning individual `.zarray`, `.zattrs`, and `.zgroup` files
+- **Zarr v2 and v3 Support**: Works with both Zarr v2 and v3 stores
+- **Consolidated Metadata Support**: Efficiently reads `.zmetadata` (v2) or `zarr.json` (v3) files when available
+- **Hierarchical Fallback**: Gracefully falls back to scanning individual metadata files
 - **Dimension Inference**: Automatically detects dimensions and identifies unlimited dimensions
 - **Complete Metadata**: Extracts all store information including attributes, data types, and compression settings
 - **Colored Output**: Optional syntax highlighting for improved readability
@@ -122,18 +123,17 @@ The tool automatically detects unlimited dimensions by:
 
 ### Supported
 
-- Zarr v2 specification
-- Consolidated metadata (`.zmetadata`)
-- Hierarchical metadata (`.zarray`, `.zattrs`, `.zgroup`)
+- Zarr v2 and v3 specifications
+- **v2**: Consolidated metadata (`.zmetadata`) and hierarchical metadata (`.zarray`, `.zattrs`, `.zgroup`)
+- **v3**: Consolidated metadata in `zarr.json` and individual `zarr.json` files per array
 - All standard data types (`float32`, `int64`, `bool`, etc.)
 - Compression settings (zlib, blosc, zstd, etc.)
 - Array attributes and global attributes
-- Dimension inference via `_ARRAY_DIMENSIONS`
+- Dimension inference via `_ARRAY_DIMENSIONS` (v2) or `dimension_names` (v3)
 - Nested groups
 
 ### Current Limitations
 
-- **Zarr v3**: Only Zarr v2 is currently supported
 - **Remote Stores**: Only local filesystem stores (no S3, HTTP, etc.)
 - **Large Arrays**: No data inspection, metadata only
 - **Complex Dtypes**: Basic support for structured dtypes
@@ -154,10 +154,11 @@ The tool automatically detects unlimited dimensions by:
 
 ### Metadata Loading Strategy
 
-1. **Primary**: Attempt to read consolidated metadata from `.zmetadata`
-2. **Fallback**: Hierarchical scan of `.zarray`, `.zattrs`, and `.zgroup` files
-3. **Dimension Inference**: Build dimension map from `_ARRAY_DIMENSIONS` attributes
-4. **Output**: Format in familiar NetCDF `ncdump` style
+1. **Format Detection**: Check for `zarr.json` (v3) or `.zmetadata` (v2) at root
+2. **Primary**: Attempt to read consolidated metadata from `zarr.json` or `.zmetadata`
+3. **Fallback**: Hierarchical scan of individual metadata files (`.zarray`/`.zattrs`/`.zgroup` for v2, or `zarr.json` for v3)
+4. **Dimension Inference**: Build dimension map from `_ARRAY_DIMENSIONS` (v2) or `dimension_names` (v3) attributes
+5. **Output**: Format in familiar NetCDF `ncdump` style
 
 ## Development
 

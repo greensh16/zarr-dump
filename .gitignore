@@ -24,3 +24,5 @@ target
 docs/
 test_data/
 .DS_Store
+*.zarr/
+WARP.md
