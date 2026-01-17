@@ -24,6 +24,7 @@ pub enum AttributeValue {
 
 /// Represents a single attribute
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Attribute {
     pub name: String,
     pub value: AttributeValue,
