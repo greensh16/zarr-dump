@@ -538,6 +538,119 @@ impl ZarrStore {
         self.read_zarr_array_data(variable).await
     }
 
+    /// Read a subset of an array and return the values as `f64`.
+    ///
+    /// This is intended for plotting (a 2D slice is represented as an N-D subset where all
+    /// non-plotted dimensions have length 1).
+    pub fn read_array_subset_f64(
+        &self,
+        variable: &Variable,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<f64>> {
+        use std::sync::Arc;
+        use zarrs::array::{Array, DataType};
+        use zarrs::array_subset::ArraySubset;
+        use zarrs::storage::store::FilesystemStore;
+
+        let store = FilesystemStore::new(&self.path)
+            .map_err(|e| anyhow::anyhow!("Failed to create zarrs FilesystemStore: {}", e))?;
+
+        let array_path = if variable.path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", variable.path)
+        };
+
+        let array = Array::open(Arc::new(store), &array_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open array '{}': {}", array_path, e))?;
+
+        let subset = ArraySubset::new_with_ranges(ranges);
+        if subset.dimensionality() != array.shape().len() {
+            return Err(anyhow::anyhow!(
+                "Invalid subset dimensionality {} for array '{}' (expected {}).",
+                subset.dimensionality(),
+                variable.name,
+                array.shape().len()
+            ));
+        }
+
+        let values = match array.data_type() {
+            DataType::Float64 => array
+                .retrieve_array_subset_elements::<f64>(&subset)
+                .with_context(|| {
+                    format!("Failed to read subset for '{}' as float64", array_path)
+                })?,
+            DataType::Float32 => array
+                .retrieve_array_subset_elements::<f32>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as float32", array_path))?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            DataType::Int8 => array
+                .retrieve_array_subset_elements::<i8>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as int8", array_path))?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            DataType::Int16 => array
+                .retrieve_array_subset_elements::<i16>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as int16", array_path))?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            DataType::Int32 => array
+                .retrieve_array_subset_elements::<i32>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as int32", array_path))?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            DataType::Int64 => array
+                .retrieve_array_subset_elements::<i64>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as int64", array_path))?
+                .into_iter()
+                .map(|v| v as f64)
+                .collect(),
+            DataType::UInt8 => array
+                .retrieve_array_subset_elements::<u8>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as uint8", array_path))?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            DataType::UInt16 => array
+                .retrieve_array_subset_elements::<u16>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as uint16", array_path))?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            DataType::UInt32 => array
+                .retrieve_array_subset_elements::<u32>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as uint32", array_path))?
+                .into_iter()
+                .map(|v| v as f64)
+                .collect(),
+            DataType::UInt64 => array
+                .retrieve_array_subset_elements::<u64>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as uint64", array_path))?
+                .into_iter()
+                .map(|v| v as f64)
+                .collect(),
+            DataType::Bool => array
+                .retrieve_array_subset_elements::<bool>(&subset)
+                .with_context(|| format!("Failed to read subset for '{}' as bool", array_path))?
+                .into_iter()
+                .map(|v| if v { 1.0 } else { 0.0 })
+                .collect(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported data type '{}' for plotting. Supported: bool, int8/16/32/64, uint8/16/32/64, float32/64.",
+                    other.name()
+                ));
+            }
+        };
+
+        Ok(values)
+    }
+
     /// Read array data using the zarrs crate with proper compression support
     async fn read_zarr_array_data(&self, variable: &Variable) -> Result<Vec<f64>> {
         // Try different zarrs API approaches

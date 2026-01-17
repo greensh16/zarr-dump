@@ -11,6 +11,7 @@ A command-line tool for inspecting and summarizing Zarr store metadata, displayi
 - **Dimension Inference**: Automatically detects dimensions and identifies unlimited dimensions
 - **Complete Metadata**: Extracts all store information including attributes, data types, and compression settings
 - **Colored Output**: Optional syntax highlighting for improved readability
+- **2D Slice Plotting**: Plot a 2D slice of array data in an interactive window (`--plot ... --plot-dims ... --slice ...`)
 
 ## Installation
 
@@ -30,6 +31,9 @@ zarr-dump /path/to/zarr/store
 
 # Disable colored output
 zarr-dump /path/to/zarr/store --no-color
+
+# Plot a 2D slice (e.g. lat/lon at a fixed time index)
+zarr-dump /path/to/zarr/store --plot temperature --plot-dims lat,lon --slice time=0
 ```
 
 ### Example: Climate Data with Hierarchical Metadata
@@ -135,7 +139,7 @@ The tool automatically detects unlimited dimensions by:
 ### Current Limitations
 
 - **Remote Stores**: Only local filesystem stores (no S3, HTTP, etc.)
-- **Large Arrays**: No data inspection, metadata only
+- **Data Inspection**: Only simple data inspection is supported (coordinate data via `-c`, and 2D slice plotting via `--plot`).
 - **Complex Dtypes**: Basic support for structured dtypes
 
 ### Recommendations
@@ -183,7 +187,6 @@ See `tests/cli.rs` for examples of creating test Zarr stores programmatically.
 
 Contributions welcome! Areas for improvement:
 
-- Zarr v3 support
 - Remote store support (S3, HTTP)
 - Performance optimizations
 - Additional output formats

@@ -1,5 +1,7 @@
 mod metadata;
+mod plot;
 mod store;
+mod visualize;
 
 use anyhow::Context;
 use clap::Parser;
@@ -23,6 +25,18 @@ struct Args {
     /// Show coordinate variable data values (like ncdump -c)
     #[arg(short = 'c', long = "coordinate-data")]
     coordinate_data: bool,
+
+    /// Plot a 2D slice of a variable in an interactive window
+    #[arg(long, value_name = "VAR")]
+    plot: Option<String>,
+
+    /// Dimensions to plot, formatted as 'dim_y,dim_x'
+    #[arg(long, value_name = "DIM_Y,DIM_X", requires = "plot")]
+    plot_dims: Option<String>,
+
+    /// Fixed indices for remaining dimensions, formatted as 'dim=index'
+    #[arg(long, value_name = "DIM=INDEX", requires = "plot")]
+    slice: Vec<String>,
 }
 
 #[tokio::main]
@@ -66,9 +80,72 @@ async fn run() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to load Zarr store from '{}'", args.path.display()))?;
 
-    print_metadata_summary(&metadata, args.no_color, args.coordinate_data, &store).await?;
+    if let Some(plot_var) = &args.plot {
+        if args.coordinate_data {
+            return Err(anyhow::anyhow!(
+                "--coordinate-data (-c) is not supported with --plot. Run the commands separately."
+            ));
+        }
+
+        let plot_dims = args
+            .plot_dims
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--plot-dims is required when using --plot"))?;
+        let (dim_y, dim_x) = plot::parse_plot_dims(plot_dims)?;
+        let slices = plot::parse_slices(&args.slice)?;
+
+        let var_key = normalize_plot_variable_key(plot_var);
+        let variable = metadata.variables.get(&var_key).ok_or_else(|| {
+            let mut keys: Vec<&String> = metadata.variables.keys().collect();
+            keys.sort();
+            let shown = keys.len().min(20);
+            let preview = keys
+                .into_iter()
+                .take(shown)
+                .map(|k| if k.is_empty() { "root" } else { k.as_str() })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            anyhow::anyhow!(
+                "Variable '{}' not found in store. Available variables (first {}): {}",
+                plot_var,
+                shown,
+                preview
+            )
+        })?;
+
+        let selection = plot::build_plot_selection(variable, &dim_y, &dim_x, &slices)?;
+        let data = store
+            .read_array_subset_f64(variable, &selection.ranges)
+            .with_context(|| format!("Failed to read data for variable '{}'", plot_var))?;
+
+        let title = format!(
+            "{}: {},{}",
+            if var_key.is_empty() { "root" } else { plot_var },
+            selection.dim_y_name,
+            selection.dim_x_name
+        );
+        visualize::show_viridis_image(
+            &title,
+            &data,
+            selection.width,
+            selection.height,
+            selection.stride_y,
+            selection.stride_x,
+        )?;
+    } else {
+        print_metadata_summary(&metadata, args.no_color, args.coordinate_data, &store).await?;
+    }
 
     Ok(())
+}
+
+fn normalize_plot_variable_key(raw: &str) -> String {
+    let s = raw.trim();
+    if s == "/" || s.eq_ignore_ascii_case("root") {
+        return String::new();
+    }
+    s.trim_start_matches('/').to_string()
 }
 
 async fn print_metadata_summary(
