@@ -123,8 +123,8 @@ fn check_dimension_names(metadata: &ZarrMetadata, report: &mut CfReport) {
             ));
         }
 
-        if let Some(AttributeValue::Array(dims)) = var.attributes.get("_ARRAY_DIMENSIONS") {
-            if dims.len() != var.shape.len() {
+        match var.attributes.get("_ARRAY_DIMENSIONS") {
+            Some(AttributeValue::Array(dims)) if dims.len() != var.shape.len() => {
                 report.error(format!(
                     "Variable '{}' _ARRAY_DIMENSIONS length ({}) does not match shape dimensionality ({}).",
                     display_var_path(path, var),
@@ -132,10 +132,11 @@ fn check_dimension_names(metadata: &ZarrMetadata, report: &mut CfReport) {
                     var.shape.len()
                 ));
             }
+            _ => {}
         }
 
-        if let Some(AttributeValue::Array(dims)) = var.attributes.get("dimension_names") {
-            if dims.len() != var.shape.len() {
+        match var.attributes.get("dimension_names") {
+            Some(AttributeValue::Array(dims)) if dims.len() != var.shape.len() => {
                 report.error(format!(
                     "Variable '{}' dimension_names length ({}) does not match shape dimensionality ({}).",
                     display_var_path(path, var),
@@ -143,6 +144,7 @@ fn check_dimension_names(metadata: &ZarrMetadata, report: &mut CfReport) {
                     var.shape.len()
                 ));
             }
+            _ => {}
         }
     }
 }
