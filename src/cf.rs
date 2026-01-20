@@ -113,38 +113,86 @@ fn check_global_conventions(metadata: &ZarrMetadata, report: &mut CfReport) {
 
 fn check_dimension_names(metadata: &ZarrMetadata, report: &mut CfReport) {
     for (path, var) in &metadata.variables {
-        let dim_names_present = var.attributes.contains_key("_ARRAY_DIMENSIONS")
+        let dim_names_attr_present = var.attributes.contains_key("_ARRAY_DIMENSIONS")
             || var.attributes.contains_key("dimension_names");
 
-        if !dim_names_present && !var.shape.is_empty() {
+        if !dim_names_attr_present && !var.shape.is_empty() {
             report.warn(format!(
                 "Variable '{}' has no explicit dimension name list (_ARRAY_DIMENSIONS/dimension_names); CF tooling may have trouble interpreting axes.",
                 display_var_path(path, var)
             ));
         }
 
-        match var.attributes.get("_ARRAY_DIMENSIONS") {
-            Some(AttributeValue::Array(dims)) if dims.len() != var.shape.len() => {
-                report.error(format!(
-                    "Variable '{}' _ARRAY_DIMENSIONS length ({}) does not match shape dimensionality ({}).",
-                    display_var_path(path, var),
-                    dims.len(),
-                    var.shape.len()
-                ));
-            }
-            _ => {}
+        check_one_dimension_name_attr(metadata, report, path, var, "_ARRAY_DIMENSIONS");
+        check_one_dimension_name_attr(metadata, report, path, var, "dimension_names");
+    }
+}
+
+fn check_one_dimension_name_attr(
+    _metadata: &ZarrMetadata,
+    report: &mut CfReport,
+    path: &str,
+    var: &Variable,
+    attr_name: &str,
+) {
+    let Some(attr) = var.attributes.get(attr_name) else {
+        return;
+    };
+
+    let AttributeValue::Array(items) = attr else {
+        report.warn(format!(
+            "Variable '{}' attribute '{}' is present but not an array (found {}).",
+            display_var_path(path, var),
+            attr_name,
+            describe_attr_value(attr)
+        ));
+        return;
+    };
+
+    if items.len() != var.shape.len() {
+        report.error(format!(
+            "Variable '{}' {} length ({}) does not match shape dimensionality ({}).",
+            display_var_path(path, var),
+            attr_name,
+            items.len(),
+            var.shape.len()
+        ));
+    }
+
+    let mut names: Vec<&str> = Vec::new();
+    let mut any_non_string = false;
+    for item in items {
+        match item {
+            AttributeValue::String(s) => names.push(s.as_str()),
+            _ => any_non_string = true,
+        }
+    }
+
+    if any_non_string {
+        report.warn(format!(
+            "Variable '{}' {} contains non-string entries; expected an array of strings.",
+            display_var_path(path, var),
+            attr_name
+        ));
+    }
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in names {
+        if name.trim().is_empty() {
+            report.warn(format!(
+                "Variable '{}' {} contains an empty dimension name.",
+                display_var_path(path, var),
+                attr_name
+            ));
         }
 
-        match var.attributes.get("dimension_names") {
-            Some(AttributeValue::Array(dims)) if dims.len() != var.shape.len() => {
-                report.error(format!(
-                    "Variable '{}' dimension_names length ({}) does not match shape dimensionality ({}).",
-                    display_var_path(path, var),
-                    dims.len(),
-                    var.shape.len()
-                ));
-            }
-            _ => {}
+        if !seen.insert(name) {
+            report.warn(format!(
+                "Variable '{}' {} contains duplicate dimension name '{}'.",
+                display_var_path(path, var),
+                attr_name,
+                name
+            ));
         }
     }
 }
@@ -170,11 +218,21 @@ async fn check_coordinate_variables(
     for (path, var) in coord_vars {
         let dim = &var.dimensions[0].name;
         let len = var.shape.first().copied().unwrap_or(0);
+        let coord_label = display_var_path(path, var);
+
+        let axis = axis_char(attr_string(var, "axis"));
+        let standard_name = attr_string(var, "standard_name");
+        let units = attr_string(var, "units");
+
+        let is_time = is_time_coordinate(dim, axis, standard_name, units);
+        let is_vertical = is_vertical_coordinate(dim, axis, standard_name);
+        let is_lat = is_latitude_coordinate(standard_name, units);
+        let is_lon = is_longitude_coordinate(standard_name, units);
 
         if len == 0 {
             report.warn(format!(
                 "Coordinate variable '{}' has length 0.",
-                display_var_path(path, var)
+                coord_label
             ));
         }
 
@@ -183,12 +241,12 @@ async fn check_coordinate_variables(
             Some(AttributeValue::String(_)) => {}
             Some(other) => report.warn(format!(
                 "Coordinate variable '{}' has non-string 'units' attribute: {}",
-                display_var_path(path, var),
+                coord_label,
                 describe_attr_value(other)
             )),
             None => report.warn(format!(
                 "Coordinate variable '{}' is missing 'units' attribute.",
-                display_var_path(path, var)
+                coord_label
             )),
         }
 
@@ -196,9 +254,59 @@ async fn check_coordinate_variables(
         if let Some(AttributeValue::String(sn)) = var.attributes.get("standard_name") {
             report.info(format!(
                 "Coordinate variable '{}' standard_name='{}'",
-                display_var_path(path, var),
-                sn
+                coord_label, sn
             ));
+        }
+
+        // CF-ish time coordinate checks.
+        if is_time {
+            if let Some(units) = units {
+                if !cf_time_units_looks_ok(units) {
+                    report.warn(format!(
+                        "Time coordinate variable '{}' has units='{}' (expected e.g. 'days since 1850-01-01').",
+                        coord_label, units
+                    ));
+                }
+            }
+
+            match var.attributes.get("calendar") {
+                Some(AttributeValue::String(_)) | None => {}
+                Some(other) => report.warn(format!(
+                    "Time coordinate variable '{}' has non-string 'calendar' attribute: {}",
+                    coord_label,
+                    describe_attr_value(other)
+                )),
+            }
+        }
+
+        // CF-ish vertical coordinate checks.
+        if is_vertical {
+            let positive_required = vertical_positive_required(dim, standard_name);
+
+            match var.attributes.get("positive") {
+                Some(AttributeValue::String(pos)) => {
+                    let pos_lc = pos.to_ascii_lowercase();
+                    if pos_lc != "up" && pos_lc != "down" {
+                        report.warn(format!(
+                            "Vertical coordinate variable '{}' has positive='{}' (expected 'up' or 'down').",
+                            coord_label, pos
+                        ));
+                    }
+                }
+                Some(other) => report.warn(format!(
+                    "Vertical coordinate variable '{}' has non-string 'positive' attribute: {}",
+                    coord_label,
+                    describe_attr_value(other)
+                )),
+                None => {
+                    if positive_required {
+                        report.warn(format!(
+                            "Vertical coordinate variable '{}' is missing 'positive' attribute (expected 'up' or 'down').",
+                            coord_label
+                        ));
+                    }
+                }
+            }
         }
 
         // bounds
@@ -206,32 +314,94 @@ async fn check_coordinate_variables(
             check_bounds_variable(metadata, path, var, bounds_name, report);
         }
 
-        // Light-touch monotonicity check (sample, to avoid huge reads).
+        // Light-touch monotonicity and sanity checks (sample, to avoid huge reads).
         if len >= 2 {
             let sample = len.min(10_000);
             let range = 0..sample;
-            let data = store.read_array_subset_f64(var, std::slice::from_ref(&range))?;
-            match monotonic_direction(&data) {
-                Some("increasing") => report.info(format!(
-                    "Coordinate '{}' appears monotonic increasing (checked first {} values).",
-                    dim, sample
-                )),
-                Some("decreasing") => report.info(format!(
-                    "Coordinate '{}' appears monotonic decreasing (checked first {} values).",
-                    dim, sample
-                )),
-                Some("constant") => report.warn(format!(
-                    "Coordinate '{}' appears constant (checked first {} values).",
-                    dim, sample
-                )),
-                None => report.warn(format!(
-                    "Coordinate '{}' is not monotonic (checked first {} values).",
-                    dim, sample
-                )),
-                Some(other) => report.info(format!(
-                    "Coordinate '{}' monotonicity: {} (checked first {} values).",
-                    dim, other, sample
-                )),
+
+            let missing_values = collect_missing_values_f64(var);
+
+            match store.read_array_subset_f64(var, std::slice::from_ref(&range)) {
+                Ok(data) => {
+                    let direction = monotonic_direction(&data, &missing_values);
+
+                    if is_time {
+                        match direction {
+                            Some("increasing") => report.info(format!(
+                                "Time coordinate '{}' appears monotonic increasing (checked first {} values).",
+                                dim, sample
+                            )),
+                            Some("decreasing") => report.warn(format!(
+                                "Time coordinate '{}' appears monotonic decreasing (expected increasing; checked first {} values).",
+                                dim, sample
+                            )),
+                            Some("constant") => report.warn(format!(
+                                "Time coordinate '{}' appears constant (expected increasing; checked first {} values).",
+                                dim, sample
+                            )),
+                            None => report.warn(format!(
+                                "Time coordinate '{}' is not monotonic (expected increasing; checked first {} values).",
+                                dim, sample
+                            )),
+                            Some(other) => report.info(format!(
+                                "Time coordinate '{}' monotonicity: {} (checked first {} values).",
+                                dim, other, sample
+                            )),
+                        }
+                    } else {
+                        match direction {
+                            Some("increasing") => report.info(format!(
+                                "Coordinate '{}' appears monotonic increasing (checked first {} values).",
+                                dim, sample
+                            )),
+                            Some("decreasing") => report.info(format!(
+                                "Coordinate '{}' appears monotonic decreasing (checked first {} values).",
+                                dim, sample
+                            )),
+                            Some("constant") => report.warn(format!(
+                                "Coordinate '{}' appears constant (checked first {} values).",
+                                dim, sample
+                            )),
+                            None => report.warn(format!(
+                                "Coordinate '{}' is not monotonic (checked first {} values).",
+                                dim, sample
+                            )),
+                            Some(other) => report.info(format!(
+                                "Coordinate '{}' monotonicity: {} (checked first {} values).",
+                                dim, other, sample
+                            )),
+                        }
+                    }
+
+                    if is_lat || is_lon {
+                        if let Some((min, max)) = sample_min_max(&data, &missing_values) {
+                            if is_lat && (min < -90.0 - 1e-6 || max > 90.0 + 1e-6) {
+                                report.warn(format!(
+                                    "Latitude coordinate '{}' sample range [{:.6}, {:.6}] looks out of bounds for degrees_north.",
+                                    dim, min, max
+                                ));
+                            }
+
+                            if is_lon && (min < -360.0 - 1e-6 || max > 360.0 + 1e-6) {
+                                report.warn(format!(
+                                    "Longitude coordinate '{}' sample range [{:.6}, {:.6}] looks out of bounds for degrees_east.",
+                                    dim, min, max
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let kind = if is_time {
+                        "time coordinate"
+                    } else {
+                        "coordinate"
+                    };
+                    report.warn(format!(
+                        "Skipping monotonicity check for {} '{}' ({}): {}",
+                        kind, dim, coord_label, err
+                    ));
+                }
             }
         }
     }
@@ -400,9 +570,174 @@ fn resolve_related_var<'a>(
     None
 }
 
-fn monotonic_direction(values: &[f64]) -> Option<&'static str> {
-    // Ignore non-finite values for monotonicity checks.
-    let filtered: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+fn attr_string<'a>(var: &'a Variable, key: &str) -> Option<&'a str> {
+    match var.attributes.get(key) {
+        Some(AttributeValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn axis_char(axis: Option<&str>) -> Option<char> {
+    axis.and_then(|s| s.chars().next())
+        .map(|c| c.to_ascii_uppercase())
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.get(0..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn cf_time_units_looks_ok(units: &str) -> bool {
+    let units = units.trim();
+    if units.is_empty() {
+        return false;
+    }
+
+    let u = units.to_ascii_lowercase();
+    let Some((prefix, rest)) = u.split_once(" since ") else {
+        return false;
+    };
+
+    let prefix = prefix.trim();
+    let rest = rest.trim();
+
+    if rest.is_empty() || !rest.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    matches!(
+        prefix,
+        "seconds"
+            | "second"
+            | "minutes"
+            | "minute"
+            | "hours"
+            | "hour"
+            | "days"
+            | "day"
+            | "months"
+            | "month"
+            | "years"
+            | "year"
+    )
+}
+
+fn is_time_coordinate(
+    name: &str,
+    axis: Option<char>,
+    standard_name: Option<&str>,
+    units: Option<&str>,
+) -> bool {
+    if axis == Some('T') {
+        return true;
+    }
+
+    if standard_name.is_some_and(|sn| sn.eq_ignore_ascii_case("time")) {
+        return true;
+    }
+
+    if name.eq_ignore_ascii_case("time") || starts_with_ignore_ascii_case(name, "time") {
+        return true;
+    }
+
+    units.is_some_and(cf_time_units_looks_ok)
+}
+
+fn units_looks_like_latitude(units: &str) -> bool {
+    let u = units.to_ascii_lowercase();
+    u.contains("degrees_north") || u.contains("degree_north")
+}
+
+fn units_looks_like_longitude(units: &str) -> bool {
+    let u = units.to_ascii_lowercase();
+    u.contains("degrees_east") || u.contains("degree_east")
+}
+
+fn is_latitude_coordinate(standard_name: Option<&str>, units: Option<&str>) -> bool {
+    standard_name.is_some_and(|sn| sn.eq_ignore_ascii_case("latitude"))
+        || units.is_some_and(units_looks_like_latitude)
+}
+
+fn is_longitude_coordinate(standard_name: Option<&str>, units: Option<&str>) -> bool {
+    standard_name.is_some_and(|sn| sn.eq_ignore_ascii_case("longitude"))
+        || units.is_some_and(units_looks_like_longitude)
+}
+
+fn standard_name_suggests_vertical(sn: &str) -> bool {
+    sn.eq_ignore_ascii_case("air_pressure")
+        || sn.eq_ignore_ascii_case("depth")
+        || sn.eq_ignore_ascii_case("altitude")
+        || sn.eq_ignore_ascii_case("geopotential_height")
+        || sn.eq_ignore_ascii_case("model_level_number")
+        || sn.eq_ignore_ascii_case("atmosphere_hybrid_sigma_pressure_coordinate")
+        || sn.eq_ignore_ascii_case("atmosphere_hybrid_height_coordinate")
+        || sn.eq_ignore_ascii_case("atmosphere_sigma_coordinate")
+        || sn.eq_ignore_ascii_case("ocean_sigma_coordinate")
+        || sn.eq_ignore_ascii_case("ocean_sigma_z_coordinate")
+        || sn.eq_ignore_ascii_case("ocean_s_coordinate")
+        || sn.eq_ignore_ascii_case("ocean_s_coordinate_g1")
+        || sn.eq_ignore_ascii_case("ocean_s_coordinate_g2")
+        || sn.eq_ignore_ascii_case("ocean_double_sigma_coordinate")
+}
+
+fn is_vertical_coordinate(name: &str, axis: Option<char>, standard_name: Option<&str>) -> bool {
+    if axis == Some('Z') {
+        return true;
+    }
+
+    if standard_name.is_some_and(standard_name_suggests_vertical) {
+        return true;
+    }
+
+    name.eq_ignore_ascii_case("lev")
+        || name.eq_ignore_ascii_case("level")
+        || name.eq_ignore_ascii_case("plev")
+        || name.eq_ignore_ascii_case("depth")
+        || name.eq_ignore_ascii_case("altitude")
+        || name.eq_ignore_ascii_case("height")
+        || name.eq_ignore_ascii_case("z")
+}
+
+fn vertical_positive_required(name: &str, standard_name: Option<&str>) -> bool {
+    if name.eq_ignore_ascii_case("depth")
+        || name.eq_ignore_ascii_case("altitude")
+        || name.eq_ignore_ascii_case("height")
+    {
+        return true;
+    }
+
+    standard_name.is_some_and(|sn| {
+        sn.eq_ignore_ascii_case("depth")
+            || sn.eq_ignore_ascii_case("altitude")
+            || sn.eq_ignore_ascii_case("geopotential_height")
+    })
+}
+
+fn sample_min_max(values: &[f64], missing_values: &[f64]) -> Option<(f64, f64)> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut any = false;
+
+    for v in values.iter().copied() {
+        if !v.is_finite() || missing_values.contains(&v) {
+            continue;
+        }
+
+        any = true;
+        min = min.min(v);
+        max = max.max(v);
+    }
+
+    if any { Some((min, max)) } else { None }
+}
+
+fn monotonic_direction(values: &[f64], missing_values: &[f64]) -> Option<&'static str> {
+    // Ignore non-finite and missing values for monotonicity checks.
+    let filtered: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && !missing_values.contains(v))
+        .collect();
     if filtered.len() < 2 {
         return None;
     }
@@ -441,6 +776,39 @@ fn monotonic_direction(values: &[f64]) -> Option<&'static str> {
     }
 }
 
+fn collect_missing_values_f64(var: &Variable) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+
+    if let Some(v) = var.attributes.get("_FillValue") {
+        push_missing_values_attr(&mut out, v);
+    }
+
+    if let Some(v) = var.attributes.get("missing_value") {
+        push_missing_values_attr(&mut out, v);
+    }
+
+    if let Some(v) = &var.fill_value {
+        push_missing_values_attr(&mut out, v);
+    }
+
+    out.sort_by(|a, b| a.total_cmp(b));
+    out.dedup();
+    out
+}
+
+fn push_missing_values_attr(out: &mut Vec<f64>, value: &AttributeValue) {
+    match value {
+        AttributeValue::Number(v) => out.push(*v),
+        AttributeValue::Integer(v) => out.push(*v as f64),
+        AttributeValue::Array(values) => {
+            for v in values {
+                push_missing_values_attr(out, v);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn display_var_path(path: &str, var: &Variable) -> String {
     if path.is_empty() {
         "root".to_string()
@@ -469,16 +837,60 @@ mod tests {
 
     #[test]
     fn test_monotonic_direction() {
-        assert_eq!(monotonic_direction(&[0.0, 1.0, 2.0]), Some("increasing"));
-        assert_eq!(monotonic_direction(&[2.0, 1.0, 0.0]), Some("decreasing"));
-        assert_eq!(monotonic_direction(&[1.0, 1.0, 1.0]), Some("constant"));
-        assert_eq!(monotonic_direction(&[0.0, 1.0, 0.5]), None);
+        assert_eq!(
+            monotonic_direction(&[0.0, 1.0, 2.0], &[]),
+            Some("increasing")
+        );
+        assert_eq!(
+            monotonic_direction(&[2.0, 1.0, 0.0], &[]),
+            Some("decreasing")
+        );
+        assert_eq!(monotonic_direction(&[1.0, 1.0, 1.0], &[]), Some("constant"));
+        assert_eq!(monotonic_direction(&[0.0, 1.0, 0.5], &[]), None);
 
         // Non-finite values are ignored
         assert_eq!(
-            monotonic_direction(&[0.0, f64::NAN, 1.0, 2.0]),
+            monotonic_direction(&[0.0, f64::NAN, 1.0, 2.0], &[]),
             Some("increasing")
         );
+
+        // Missing values are ignored
+        assert_eq!(
+            monotonic_direction(&[0.0, -9999.0, 1.0, 2.0], &[-9999.0]),
+            Some("increasing")
+        );
+    }
+
+    #[test]
+    fn test_cf_time_units_looks_ok() {
+        assert!(cf_time_units_looks_ok("days since 1850-01-01"));
+        assert!(cf_time_units_looks_ok("hours since 2000-01-01 00:00:00"));
+        assert!(cf_time_units_looks_ok("seconds since 1970-01-01T00:00:00Z"));
+
+        assert!(!cf_time_units_looks_ok("days"));
+        assert!(!cf_time_units_looks_ok("meters"));
+        assert!(!cf_time_units_looks_ok("days since"));
+        assert!(!cf_time_units_looks_ok("days since not-a-date"));
+    }
+
+    #[test]
+    fn test_lat_lon_detection() {
+        assert!(units_looks_like_latitude("degrees_north"));
+        assert!(units_looks_like_latitude("degree_north"));
+        assert!(units_looks_like_longitude("degrees_east"));
+        assert!(units_looks_like_longitude("degree_east"));
+
+        assert!(is_latitude_coordinate(Some("latitude"), None));
+        assert!(is_longitude_coordinate(Some("longitude"), None));
+        assert!(is_latitude_coordinate(None, Some("degrees_north")));
+        assert!(is_longitude_coordinate(None, Some("degrees_east")));
+    }
+
+    #[test]
+    fn test_vertical_positive_required() {
+        assert!(vertical_positive_required("depth", None));
+        assert!(vertical_positive_required("lev", Some("depth")));
+        assert!(!vertical_positive_required("lev", Some("air_pressure")));
     }
 
     #[test]
