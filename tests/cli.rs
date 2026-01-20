@@ -284,6 +284,31 @@ fn test_cli_with_consolidated_store() {
 }
 
 #[test]
+fn test_cli_cf_check() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let store_path = temp_dir.path();
+
+    create_sample_store(store_path).expect("Failed to create sample store");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
+        .arg("cf-check")
+        .arg(store_path.to_str().unwrap())
+        .output()
+        .expect("Failed to execute zarr-dump cf-check");
+
+    assert!(
+        output.status.success(),
+        "cf-check failed with status: {:?}\nStderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cf-check"), "Missing cf-check header");
+    assert!(stdout.contains("Summary:"), "Missing cf-check summary");
+}
+
+#[test]
 fn test_cli_with_nonexistent_path() {
     let output = Command::new(env!("CARGO_BIN_EXE_zarr-dump"))
         .arg("/nonexistent/path")

@@ -1,22 +1,37 @@
+mod cf;
 mod metadata;
 mod plot;
 mod store;
 mod visualize;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use metadata::{AttributeValue, ZarrMetadata};
 use std::path::PathBuf;
 use std::process;
 use store::ZarrStore;
 
+#[derive(Subcommand)]
+enum Command {
+    /// Check CF conventions (metadata + light-touch coordinate checks)
+    CfCheck {
+        /// Path to the Zarr store root directory
+        path: PathBuf,
+    },
+}
+
 #[derive(Parser)]
 #[command(name = "zarr-dump")]
 #[command(version)]
 #[command(about = "A tool for summarizing Zarr stores")]
+#[command(arg_required_else_help = true)]
+#[command(subcommand_precedence_over_arg = true)]
 struct Args {
-    /// Path to the Zarr store root directory
-    path: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Path to the Zarr store root directory (for the default dump/plot mode)
+    path: Option<PathBuf>,
 
     /// Disable colored output
     #[arg(long)]
@@ -56,31 +71,55 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    let (path, mode) = match &args.command {
+        Some(Command::CfCheck { path }) => (path.clone(), "cf-check"),
+        None => (
+            args.path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Missing Zarr store path"))?,
+            "default",
+        ),
+    };
+
     // Validate that the path exists and is a directory
-    if !args.path.exists() {
+    if !path.exists() {
         return Err(anyhow::anyhow!(
             "Zarr store path '{}' does not exist. Please provide a valid path to a Zarr store directory.",
-            args.path.display()
+            path.display()
         ));
     }
 
-    if !args.path.is_dir() {
+    if !path.is_dir() {
         return Err(anyhow::anyhow!(
             "Path '{}' is not a directory. Zarr stores must be directories containing .zarray, .zgroup, or .zmetadata files.",
-            args.path.display()
+            path.display()
         ));
     }
 
-    println!("Opening Zarr store: {}", args.path.display());
+    println!("Opening Zarr store: {}", path.display());
 
     // Create and load Zarr store
-    let store = ZarrStore::new(&args.path)?;
+    let store = ZarrStore::new(&path)?;
     let metadata = store
         .load_metadata()
         .await
-        .with_context(|| format!("Failed to load Zarr store from '{}'", args.path.display()))?;
+        .with_context(|| format!("Failed to load Zarr store from '{}'", path.display()))?;
+
+    if mode == "cf-check" {
+        let report = cf::cf_check(&store, &metadata).await?;
+        report.print();
+        if report.has_errors() {
+            return Err(anyhow::anyhow!("CF check failed"));
+        }
+        return Ok(());
+    }
 
     if let Some(plot_var) = &args.plot {
+        if args.command.is_some() {
+            return Err(anyhow::anyhow!(
+                "Plotting is only supported in the default mode. Use `zarr-dump STORE --plot ...`, not a subcommand."
+            ));
+        }
         if args.coordinate_data {
             return Err(anyhow::anyhow!(
                 "--coordinate-data (-c) is not supported with --plot. Run the commands separately."
@@ -119,21 +158,70 @@ async fn run() -> anyhow::Result<()> {
             .read_array_subset_f64(variable, &selection.ranges)
             .with_context(|| format!("Failed to read data for variable '{}'", plot_var))?;
 
-        let title = format!(
+        let title_base = format!(
             "{}: {},{}",
             if var_key.is_empty() { "root" } else { plot_var },
             selection.dim_y_name,
             selection.dim_x_name
         );
-        visualize::show_viridis_image(
-            &title,
-            &data,
-            selection.width,
-            selection.height,
-            selection.stride_y,
-            selection.stride_x,
-        )?;
+
+        let mut nav_dims = Vec::new();
+        for (i, dim) in variable.dimensions.iter().enumerate() {
+            if dim.name == dim_y || dim.name == dim_x {
+                continue;
+            }
+
+            let idx = *slices
+                .get(&dim.name)
+                .expect("slice indices should be validated by build_plot_selection");
+            let size = variable.shape[i];
+            if size == 0 {
+                return Err(anyhow::anyhow!(
+                    "Dimension '{}' has length 0 in variable '{}' (cannot navigate).",
+                    dim.name,
+                    variable.name
+                ));
+            }
+
+            nav_dims.push(visualize::SliceDimension {
+                name: dim.name.clone(),
+                index: idx,
+                max: size - 1,
+            });
+        }
+
+        let view = visualize::ImageView {
+            width: selection.width,
+            height: selection.height,
+            stride_y: selection.stride_y,
+            stride_x: selection.stride_x,
+        };
+
+        if nav_dims.is_empty() {
+            visualize::show_viridis_image(&title_base, &data, view)?;
+        } else {
+            println!(
+                "Navigation: Tab=next dim, ←/→ or ↑/↓=±1 (Shift=×10), PgUp/PgDn=±10 (Shift=×100), Home/End=min/max, Esc/q=quit"
+            );
+            visualize::show_viridis_image_with_navigation(
+                &title_base,
+                data,
+                view,
+                nav_dims,
+                |dims| {
+                    let slices: std::collections::HashMap<String, u64> =
+                        dims.iter().map(|d| (d.name.clone(), d.index)).collect();
+                    let selection = plot::build_plot_selection(variable, &dim_y, &dim_x, &slices)?;
+                    store.read_array_subset_f64(variable, &selection.ranges)
+                },
+            )?;
+        }
     } else {
+        if args.command.is_some() {
+            return Err(anyhow::anyhow!(
+                "This subcommand does not support metadata dump output."
+            ));
+        }
         print_metadata_summary(&metadata, args.no_color, args.coordinate_data, &store).await?;
     }
 
