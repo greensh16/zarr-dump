@@ -23,6 +23,22 @@ pub struct CfReport {
     errors: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct CfAxisSummary {
+    pub axis: char,
+    pub dim: String,
+    pub coord_var: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CfSummary {
+    pub conventions: Option<String>,
+    pub axes: Vec<CfAxisSummary>,
+    pub suggested_plot_dims: Option<(String, String)>,
+    pub suggested_slice_dims: Vec<String>,
+    pub candidate_data_vars: Vec<String>,
+}
+
 impl CfReport {
     fn info(&mut self, msg: impl Into<String>) {
         self.issues.push(Issue {
@@ -85,6 +101,254 @@ pub async fn cf_check(store: &ZarrStore, metadata: &ZarrMetadata) -> Result<CfRe
     check_coordinates_attribute_refs(metadata, &mut report);
 
     Ok(report)
+}
+
+pub fn cf_summary(metadata: &ZarrMetadata) -> CfSummary {
+    let conventions = metadata
+        .global_attributes
+        .get("Conventions")
+        .or_else(|| metadata.global_attributes.get("conventions"))
+        .and_then(|v| match v {
+            AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+
+    let coord_vars = find_coordinate_variables(metadata);
+    let coord_paths: HashSet<&str> = coord_vars.iter().map(|(p, _)| p.as_str()).collect();
+
+    let mut bounds_paths: HashSet<String> = HashSet::new();
+    for (coord_path, coord_var) in &coord_vars {
+        let Some(AttributeValue::String(bounds_name)) = coord_var.attributes.get("bounds") else {
+            continue;
+        };
+
+        if let Some((bounds_path, _bounds_var)) =
+            resolve_related_var(metadata, coord_path, bounds_name)
+        {
+            bounds_paths.insert(bounds_path.clone());
+        }
+    }
+
+    let mut axis_candidates: Vec<CfAxisSummary> = Vec::new();
+    for (path, var) in &coord_vars {
+        let axis_attr = axis_char(attr_string(var, "axis"));
+        let standard_name = attr_string(var, "standard_name");
+        let units = attr_string(var, "units");
+
+        let is_time = is_time_coordinate(&var.name, axis_attr, standard_name, units);
+        let is_vertical = is_vertical_coordinate(&var.name, axis_attr, standard_name);
+        let is_lat = is_latitude_coordinate(standard_name, units);
+        let is_lon = is_longitude_coordinate(standard_name, units);
+
+        let axis = if is_time {
+            'T'
+        } else if is_vertical {
+            'Z'
+        } else if is_lat {
+            'Y'
+        } else if is_lon {
+            'X'
+        } else {
+            axis_attr.unwrap_or('?')
+        };
+
+        let dim = var
+            .dimensions
+            .first()
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| var.name.clone());
+
+        axis_candidates.push(CfAxisSummary {
+            axis,
+            dim,
+            coord_var: display_var_path(path, var),
+        });
+    }
+
+    let mut axes: Vec<CfAxisSummary> = Vec::new();
+    for axis in ['T', 'Z', 'Y', 'X'] {
+        if let Some(best) = best_axis_candidate(axis, &axis_candidates) {
+            axes.push(best);
+        }
+    }
+
+    // Suggested plot dims: prefer Y/X axes (lat/lon or y/x).
+    let plot_dim_y = axes
+        .iter()
+        .find(|a| a.axis == 'Y')
+        .map(|a| a.dim.clone())
+        .or_else(|| find_dimension_name(metadata, &["lat", "latitude", "y"]));
+
+    let plot_dim_x = axes
+        .iter()
+        .find(|a| a.axis == 'X')
+        .map(|a| a.dim.clone())
+        .or_else(|| find_dimension_name(metadata, &["lon", "longitude", "x"]));
+
+    let suggested_plot_dims = match (plot_dim_y, plot_dim_x) {
+        (Some(y), Some(x)) => Some((y, x)),
+        _ => None,
+    };
+
+    // Suggested slice dims: prefer T and Z axes.
+    let mut suggested_slice_dims: Vec<String> = Vec::new();
+    if let Some(t) = axes
+        .iter()
+        .find(|a| a.axis == 'T')
+        .map(|a| a.dim.clone())
+        .or_else(|| find_dimension_name(metadata, &["time", "t"]))
+    {
+        suggested_slice_dims.push(t);
+    }
+
+    if let Some(z) = axes
+        .iter()
+        .find(|a| a.axis == 'Z')
+        .map(|a| a.dim.clone())
+        .or_else(|| find_dimension_name(metadata, &["lev", "level", "plev", "depth", "z"]))
+    {
+        if !suggested_slice_dims.iter().any(|d| d == &z) {
+            suggested_slice_dims.push(z);
+        }
+    }
+
+    // If plot dims are known, don't repeat them as slice dims.
+    if let Some((y, x)) = &suggested_plot_dims {
+        suggested_slice_dims.retain(|d| d != y && d != x);
+    }
+
+    // Candidate data variables: exclude coordinate vars, bounds vars, and grid_mapping variables.
+    let mut candidates: Vec<(String, u128, usize)> = Vec::new();
+    for (path, var) in &metadata.variables {
+        if coord_paths.contains(path.as_str()) {
+            continue;
+        }
+
+        if bounds_paths.contains(path) {
+            continue;
+        }
+
+        if var.attributes.contains_key("grid_mapping_name") {
+            continue;
+        }
+
+        let var_path = display_var_path(path, var);
+        let nelems = approx_num_elements(&var.shape);
+        candidates.push((var_path, nelems, var.shape.len()));
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let candidate_data_vars = candidates
+        .into_iter()
+        .filter(|(_name, nelems, _ndim)| *nelems > 0)
+        .take(10)
+        .map(|(name, _nelems, _ndim)| name)
+        .collect();
+
+    CfSummary {
+        conventions,
+        axes,
+        suggested_plot_dims,
+        suggested_slice_dims,
+        candidate_data_vars,
+    }
+}
+
+fn approx_num_elements(shape: &[u64]) -> u128 {
+    shape
+        .iter()
+        .copied()
+        .map(u128::from)
+        .fold(1u128, |acc, n| acc.saturating_mul(n))
+}
+
+fn find_dimension_name(metadata: &ZarrMetadata, preferred: &[&str]) -> Option<String> {
+    for want in preferred {
+        if metadata.dimensions.contains_key(*want) {
+            return Some((*want).to_string());
+        }
+    }
+
+    for want in preferred {
+        for key in metadata.dimensions.keys() {
+            if key.eq_ignore_ascii_case(want) {
+                return Some(key.clone());
+            }
+        }
+    }
+
+    None
+}
+
+fn best_axis_candidate(axis: char, candidates: &[CfAxisSummary]) -> Option<CfAxisSummary> {
+    let mut best: Option<&CfAxisSummary> = None;
+    for cand in candidates.iter().filter(|c| c.axis == axis) {
+        best = match best {
+            None => Some(cand),
+            Some(current) => {
+                if axis_candidate_rank(axis, cand) < axis_candidate_rank(axis, current) {
+                    Some(cand)
+                } else {
+                    Some(current)
+                }
+            }
+        };
+    }
+
+    best.cloned()
+}
+
+fn axis_candidate_rank(axis: char, cand: &CfAxisSummary) -> (u8, usize, &str) {
+    let pref = axis_preference(axis, &cand.dim);
+    let depth = cand.coord_var.matches('/').count();
+    (pref, depth, cand.coord_var.as_str())
+}
+
+fn axis_preference(axis: char, dim: &str) -> u8 {
+    match axis {
+        'T' => {
+            if dim.eq_ignore_ascii_case("time") {
+                0
+            } else {
+                1
+            }
+        }
+        'Y' => {
+            if dim.eq_ignore_ascii_case("lat") || dim.eq_ignore_ascii_case("latitude") {
+                0
+            } else if dim.eq_ignore_ascii_case("y") {
+                1
+            } else {
+                2
+            }
+        }
+        'X' => {
+            if dim.eq_ignore_ascii_case("lon") || dim.eq_ignore_ascii_case("longitude") {
+                0
+            } else if dim.eq_ignore_ascii_case("x") {
+                1
+            } else {
+                2
+            }
+        }
+        'Z' => {
+            if dim.eq_ignore_ascii_case("lev")
+                || dim.eq_ignore_ascii_case("level")
+                || dim.eq_ignore_ascii_case("plev")
+                || dim.eq_ignore_ascii_case("depth")
+            {
+                0
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    }
 }
 
 fn check_global_conventions(metadata: &ZarrMetadata, report: &mut CfReport) {

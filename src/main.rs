@@ -283,6 +283,9 @@ impl NetCdfFormatter {
         // Global attributes section
         self.print_global_attributes(metadata);
 
+        // CF summary section
+        self.print_cf_summary(metadata);
+
         // Coordinate data section (if requested)
         if coordinate_data {
             self.print_coordinate_data(metadata, store).await?;
@@ -387,6 +390,63 @@ impl NetCdfFormatter {
                 "    :{} = {} ;",
                 self.colorize(key, "33"), // Yellow for attribute name
                 formatted_value
+            );
+        }
+    }
+
+    fn print_cf_summary(&self, metadata: &ZarrMetadata) {
+        let summary = cf::cf_summary(metadata);
+
+        println!("{}", self.colorize("// CF summary:", "90"));
+
+        match &summary.conventions {
+            Some(s) => println!("    // Conventions: {}", self.colorize(s, "31")),
+            None => println!("    // Conventions: <missing>"),
+        }
+
+        if summary.axes.is_empty() {
+            println!("    // Axes: <none detected>");
+        } else {
+            println!("    // Axes:");
+            for axis in &summary.axes {
+                println!(
+                    "    //   {}: {} (dim '{}')",
+                    self.colorize(&axis.axis.to_string(), "33"),
+                    self.colorize(&axis.coord_var, "36"),
+                    self.colorize(&axis.dim, "36")
+                );
+            }
+        }
+
+        if let Some((dim_y, dim_x)) = &summary.suggested_plot_dims {
+            println!(
+                "    // Suggested plot dims: {},{}",
+                self.colorize(dim_y, "36"),
+                self.colorize(dim_x, "36")
+            );
+        }
+
+        if !summary.suggested_slice_dims.is_empty() {
+            println!(
+                "    // Suggested slice dims: {}",
+                summary
+                    .suggested_slice_dims
+                    .iter()
+                    .map(|d| self.colorize(d, "36"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        if !summary.candidate_data_vars.is_empty() {
+            println!(
+                "    // Candidate data variables: {}",
+                summary
+                    .candidate_data_vars
+                    .iter()
+                    .map(|v| self.colorize(v, "36"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
     }
