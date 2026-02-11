@@ -6,9 +6,8 @@ mod visualize;
 use anyhow::Context;
 use clap::Parser;
 use metadata::{AttributeValue, ZarrMetadata};
-use std::path::PathBuf;
-use std::process;
-use store::ZarrStore;
+use std::{path::PathBuf, process};
+use store::{StoreBackend, StoreBackendError, ZarrStore};
 
 #[derive(Parser)]
 #[command(name = "zarr-dump")]
@@ -16,7 +15,7 @@ use store::ZarrStore;
 #[command(about = "A tool for summarizing Zarr stores")]
 struct Args {
     /// Path to the Zarr store root directory
-    path: PathBuf,
+    path: String,
 
     /// Disable colored output
     #[arg(long)]
@@ -39,6 +38,27 @@ struct Args {
     slice: Vec<String>,
 }
 
+impl Args {
+    fn to_store_backend(&self) -> Result<StoreBackend, StoreBackendError> {
+        let path = PathBuf::from(&self.path);
+        if path.exists() {
+            if path.is_dir() {
+                Ok(StoreBackend::Local(path))
+            } else {
+                Err(StoreBackendError::StoreNotDirectory(self.path.clone()))
+            }
+        } else {
+            match Path::parse(&self.path) {
+                Ok(parsed_path) => Ok(StoreBackend::Remote(parsed_path)),
+                Err(e) => Err(StoreBackendError::InvalidRemotePath(format!(
+                    "Error parsing remote path '{}': {}",
+                    self.path, e
+                ))),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -56,29 +76,44 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    let store_backend = match args.to_store_backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            return Err(anyhow::anyhow!(match e {
+                StoreBackendError::InvalidLocalPath(msg) => format!("Invalid local path: {}", msg),
+                StoreBackendError::InvalidRemotePath(msg) =>
+                    format!("Invalid remote path: {}", msg),
+                StoreBackendError::StoreNotDirectory(msg) =>
+                    format!("Store path is not a directory: {}", msg),
+            }));
+        }
+    };
+
     // Validate that the path exists and is a directory
-    if !args.path.exists() {
+    if !store_backend.exists() {
         return Err(anyhow::anyhow!(
             "Zarr store path '{}' does not exist. Please provide a valid path to a Zarr store directory.",
-            args.path.display()
+            args.path
         ));
     }
 
-    if !args.path.is_dir() {
+    if !store_backend.is_dir() {
         return Err(anyhow::anyhow!(
             "Path '{}' is not a directory. Zarr stores must be directories containing .zarray, .zgroup, or .zmetadata files.",
-            args.path.display()
+            args.path
         ));
     }
 
-    println!("Opening Zarr store: {}", args.path.display());
+    println!("Opening Zarr store: {}", store_backend.display());
 
     // Create and load Zarr store
-    let store = ZarrStore::new(&args.path)?;
-    let metadata = store
-        .load_metadata()
-        .await
-        .with_context(|| format!("Failed to load Zarr store from '{}'", args.path.display()))?;
+    let store = ZarrStore::new(store_backend)?;
+    let metadata = store.load_metadata().await.with_context(|| {
+        format!(
+            "Failed to load Zarr store from '{}'",
+            store_backend.display()
+        )
+    })?;
 
     if let Some(plot_var) = &args.plot {
         if args.coordinate_data {

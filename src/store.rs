@@ -1,10 +1,47 @@
 use crate::metadata::*;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
+use object_store;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub enum StoreBackend {
+    Local(PathBuf),
+    Remote(object_store::path::Path),
+}
+
+impl StoreBackend {
+    pub fn exists(&self) -> bool {
+        match self {
+            StoreBackend::Local(path) => path.exists(),
+            StoreBackend::Remote(_) => true,
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        match self {
+            StoreBackend::Local(path) => path.is_dir(),
+            StoreBackend::Remote(_) => true,
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            StoreBackend::Local(path) => path.display().to_string(),
+            StoreBackend::Remote(path) => path.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum StoreBackendError {
+    InvalidLocalPath(String),
+    InvalidRemotePath(String),
+    StoreNotDirectory(String),
+}
 
 pub struct ZarrStore {
     path: PathBuf,
