@@ -44,26 +44,26 @@ pub enum StoreBackendError {
 }
 
 pub struct ZarrStore {
-    path: PathBuf,
+    store_backend: StoreBackend,
 }
 
 impl ZarrStore {
     /// Create a new ZarrStore from a directory path
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-
-        if !path.exists() {
-            return Err(anyhow::anyhow!("Path does not exist: {}", path.display()));
-        }
-
-        if !path.is_dir() {
+    pub fn new(store_backend: StoreBackend) -> Result<Self> {
+        if !&store_backend.exists() {
             return Err(anyhow::anyhow!(
-                "Path is not a directory: {}",
-                path.display()
+                "Store path does not exist: {}",
+                store_backend.display()
+            ));
+        }
+        if !&store_backend.is_dir() {
+            return Err(anyhow::anyhow!(
+                "Store path is not a directory: {}",
+                store_backend.display()
             ));
         }
 
-        Ok(Self { path })
+        Ok(Self { store_backend })
     }
 
     /// Load metadata from the Zarr store, attempting consolidated read first
