@@ -409,11 +409,21 @@ impl NetCdfFormatter {
         } else {
             println!("    // Axes:");
             for axis in &summary.axes {
+                let dims_str = if axis.dims.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    axis.dims
+                        .iter()
+                        .map(|d| self.colorize(d, "36"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+
                 println!(
-                    "    //   {}: {} (dim '{}')",
+                    "    //   {}: {} (dims '{}')",
                     self.colorize(&axis.axis.to_string(), "33"),
                     self.colorize(&axis.coord_var, "36"),
-                    self.colorize(&axis.dim, "36")
+                    dims_str
                 );
             }
         }

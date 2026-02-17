@@ -26,7 +26,7 @@ pub struct CfReport {
 #[derive(Debug, Clone)]
 pub struct CfAxisSummary {
     pub axis: char,
-    pub dim: String,
+    pub dims: Vec<String>,
     pub coord_var: String,
 }
 
@@ -98,7 +98,14 @@ pub async fn cf_check(store: &ZarrStore, metadata: &ZarrMetadata) -> Result<CfRe
     check_dimensions_have_coordinates(metadata, &coord_vars, &mut report);
 
     check_grid_mappings(metadata, &mut report);
+
     check_coordinates_attribute_refs(metadata, &mut report);
+    check_ancillary_variables_attribute_refs(metadata, &mut report);
+    check_cell_measures_attribute(metadata, &mut report);
+    check_cell_methods_attribute(metadata, &mut report);
+    check_parametric_vertical_coordinates(metadata, &mut report);
+
+    check_lat_lon_variables(store, metadata, &mut report);
 
     Ok(report)
 }
@@ -114,99 +121,57 @@ pub fn cf_summary(metadata: &ZarrMetadata) -> CfSummary {
         });
 
     let coord_vars = find_coordinate_variables(metadata);
-    let coord_paths: HashSet<&str> = coord_vars.iter().map(|(p, _)| p.as_str()).collect();
+    let coord_var_paths: HashSet<String> = coord_vars.iter().map(|(p, _)| (*p).clone()).collect();
 
-    let mut bounds_paths: HashSet<String> = HashSet::new();
-    for (coord_path, coord_var) in &coord_vars {
-        let Some(AttributeValue::String(bounds_name)) = coord_var.attributes.get("bounds") else {
-            continue;
-        };
+    let coord_refs = collect_coordinate_references(metadata);
+    let ancillary_refs = collect_whitespace_separated_references(metadata, "ancillary_variables");
+    let cell_measures_refs = collect_cell_measures_references(metadata);
+    let bounds_refs = collect_bounds_references(metadata);
 
-        if let Some((bounds_path, _bounds_var)) =
-            resolve_related_var(metadata, coord_path, bounds_name)
-        {
-            bounds_paths.insert(bounds_path.clone());
-        }
-    }
+    let axis_candidates = collect_axis_candidates(metadata, &coord_refs);
 
-    let mut axis_candidates: Vec<CfAxisSummary> = Vec::new();
-    for (path, var) in &coord_vars {
-        let axis_attr = axis_char(attr_string(var, "axis"));
-        let standard_name = attr_string(var, "standard_name");
-        let units = attr_string(var, "units");
-
-        let is_time = is_time_coordinate(&var.name, axis_attr, standard_name, units);
-        let is_vertical = is_vertical_coordinate(&var.name, axis_attr, standard_name);
-        let is_lat = is_latitude_coordinate(standard_name, units);
-        let is_lon = is_longitude_coordinate(standard_name, units);
-
-        let axis = if is_time {
-            'T'
-        } else if is_vertical {
-            'Z'
-        } else if is_lat {
-            'Y'
-        } else if is_lon {
-            'X'
-        } else {
-            axis_attr.unwrap_or('?')
-        };
-
-        let dim = var
-            .dimensions
-            .first()
-            .map(|d| d.name.clone())
-            .unwrap_or_else(|| var.name.clone());
-
-        axis_candidates.push(CfAxisSummary {
-            axis,
-            dim,
-            coord_var: display_var_path(path, var),
-        });
-    }
+    let time_axis = select_best_time_axis(&axis_candidates);
+    let vertical_axis = select_best_vertical_axis(&axis_candidates);
+    let (y_axis, x_axis, plot_dims_from_axes) = select_best_horizontal_axes(&axis_candidates);
 
     let mut axes: Vec<CfAxisSummary> = Vec::new();
-    for axis in ['T', 'Z', 'Y', 'X'] {
-        if let Some(best) = best_axis_candidate(axis, &axis_candidates) {
-            axes.push(best);
-        }
+    if let Some(c) = &time_axis {
+        axes.push(axis_candidate_to_summary(c));
+    }
+    if let Some(c) = &vertical_axis {
+        axes.push(axis_candidate_to_summary(c));
+    }
+    if let Some(c) = &y_axis {
+        axes.push(axis_candidate_to_summary(c));
+    }
+    if let Some(c) = &x_axis {
+        axes.push(axis_candidate_to_summary(c));
     }
 
-    // Suggested plot dims: prefer Y/X axes (lat/lon or y/x).
-    let plot_dim_y = axes
-        .iter()
-        .find(|a| a.axis == 'Y')
-        .map(|a| a.dim.clone())
-        .or_else(|| find_dimension_name(metadata, &["lat", "latitude", "y"]));
-
-    let plot_dim_x = axes
-        .iter()
-        .find(|a| a.axis == 'X')
-        .map(|a| a.dim.clone())
-        .or_else(|| find_dimension_name(metadata, &["lon", "longitude", "x"]));
-
-    let suggested_plot_dims = match (plot_dim_y, plot_dim_x) {
-        (Some(y), Some(x)) => Some((y, x)),
-        _ => None,
-    };
+    let suggested_plot_dims = plot_dims_from_axes.or_else(|| {
+        let y = find_dimension_name(metadata, &["lat", "latitude", "y"])?;
+        let x = find_dimension_name(metadata, &["lon", "longitude", "x"])?;
+        Some((y, x))
+    });
 
     // Suggested slice dims: prefer T and Z axes.
     let mut suggested_slice_dims: Vec<String> = Vec::new();
-    if let Some(t) = axes
-        .iter()
-        .find(|a| a.axis == 'T')
-        .map(|a| a.dim.clone())
-        .or_else(|| find_dimension_name(metadata, &["time", "t"]))
-    {
+
+    if let Some(c) = &time_axis {
+        if let Some(d) = c.dims.first() {
+            suggested_slice_dims.push(d.clone());
+        }
+    } else if let Some(t) = find_dimension_name(metadata, &["time", "t"]) {
         suggested_slice_dims.push(t);
     }
 
-    if let Some(z) = axes
-        .iter()
-        .find(|a| a.axis == 'Z')
-        .map(|a| a.dim.clone())
-        .or_else(|| find_dimension_name(metadata, &["lev", "level", "plev", "depth", "z"]))
-    {
+    if let Some(c) = &vertical_axis {
+        if let Some(d) = c.dims.first() {
+            if !suggested_slice_dims.iter().any(|x| x == d) {
+                suggested_slice_dims.push(d.clone());
+            }
+        }
+    } else if let Some(z) = find_dimension_name(metadata, &["lev", "level", "plev", "depth", "z"]) {
         if !suggested_slice_dims.iter().any(|d| d == &z) {
             suggested_slice_dims.push(z);
         }
@@ -217,18 +182,29 @@ pub fn cf_summary(metadata: &ZarrMetadata) -> CfSummary {
         suggested_slice_dims.retain(|d| d != y && d != x);
     }
 
-    // Candidate data variables: exclude coordinate vars, bounds vars, and grid_mapping variables.
+    let mut exclude: HashSet<String> = HashSet::new();
+
+    // Exclude coordinate-like variables from the candidate data variable list.
+    exclude.extend(coord_var_paths);
+    exclude.extend(coord_refs.clone());
+    exclude.extend(ancillary_refs);
+    exclude.extend(cell_measures_refs);
+    exclude.extend(bounds_refs);
+
+    for (path, var) in &metadata.variables {
+        if var.attributes.contains_key("grid_mapping_name") {
+            exclude.insert(path.clone());
+        }
+    }
+
+    for cand in &axis_candidates {
+        exclude.insert(cand.key.clone());
+    }
+
+    // Candidate data variables: sort by size (elements) and dimensionality.
     let mut candidates: Vec<(String, u128, usize)> = Vec::new();
     for (path, var) in &metadata.variables {
-        if coord_paths.contains(path.as_str()) {
-            continue;
-        }
-
-        if bounds_paths.contains(path) {
-            continue;
-        }
-
-        if var.attributes.contains_key("grid_mapping_name") {
+        if exclude.contains(path) {
             continue;
         }
 
@@ -259,6 +235,348 @@ pub fn cf_summary(metadata: &ZarrMetadata) -> CfSummary {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AxisCandidate {
+    key: String,
+    display: String,
+    axis: char,
+    dims: Vec<String>,
+    is_dimension_coordinate: bool,
+    is_referenced: bool,
+    is_latitude: bool,
+    is_longitude: bool,
+    has_standard_name: bool,
+    has_units: bool,
+}
+
+fn axis_candidate_to_summary(c: &AxisCandidate) -> CfAxisSummary {
+    CfAxisSummary {
+        axis: c.axis,
+        dims: c.dims.clone(),
+        coord_var: c.display.clone(),
+    }
+}
+
+fn collect_axis_candidates(
+    metadata: &ZarrMetadata,
+    coord_refs: &HashSet<String>,
+) -> Vec<AxisCandidate> {
+    let mut out = Vec::new();
+
+    for (key, var) in &metadata.variables {
+        if var.dimensions.is_empty() {
+            continue;
+        }
+
+        let axis_attr = axis_char(attr_string(var, "axis"));
+        let standard_name = attr_string(var, "standard_name");
+        let units = attr_string(var, "units");
+
+        let is_time = is_time_coordinate(&var.name, axis_attr, standard_name, units);
+        let is_vertical = is_vertical_coordinate(&var.name, axis_attr, standard_name);
+        let is_latitude = is_latitude_coordinate(standard_name, units);
+        let is_longitude = is_longitude_coordinate(standard_name, units);
+
+        let axis = if is_time {
+            'T'
+        } else if is_vertical {
+            'Z'
+        } else if is_latitude {
+            'Y'
+        } else if is_longitude {
+            'X'
+        } else if standard_name.is_some_and(|sn| sn.eq_ignore_ascii_case("projection_y_coordinate"))
+        {
+            'Y'
+        } else if standard_name.is_some_and(|sn| sn.eq_ignore_ascii_case("projection_x_coordinate"))
+        {
+            'X'
+        } else if axis_attr == Some('Y') {
+            'Y'
+        } else if axis_attr == Some('X') {
+            'X'
+        } else {
+            continue;
+        };
+
+        let dims: Vec<String> = var.dimensions.iter().map(|d| d.name.clone()).collect();
+
+        // For summary purposes we only consider typical coordinate-like shapes:
+        // - T/Z: 1D
+        // - X/Y: 1D or 2D (curvilinear)
+        match axis {
+            'T' | 'Z' => {
+                if dims.len() != 1 {
+                    continue;
+                }
+            }
+            'X' | 'Y' => {
+                if dims.is_empty() || dims.len() > 2 {
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+
+        let is_dimension_coordinate = dims.len() == 1 && var.name == dims[0];
+        let is_referenced = coord_refs.contains(key);
+
+        out.push(AxisCandidate {
+            key: key.clone(),
+            display: display_var_path(key, var),
+            axis,
+            dims,
+            is_dimension_coordinate,
+            is_referenced,
+            is_latitude,
+            is_longitude,
+            has_standard_name: standard_name.is_some(),
+            has_units: units.is_some(),
+        });
+    }
+
+    out
+}
+
+fn select_best_time_axis(candidates: &[AxisCandidate]) -> Option<AxisCandidate> {
+    candidates
+        .iter()
+        .filter(|c| c.axis == 'T' && c.dims.len() == 1)
+        .min_by(|a, b| {
+            rank_time_axis(a)
+                .cmp(&rank_time_axis(b))
+                .then_with(|| a.display.cmp(&b.display))
+        })
+        .cloned()
+}
+
+fn rank_time_axis(c: &AxisCandidate) -> (u8, u8, u8, u8, u8, usize) {
+    let kind = u8::from(!c.is_dimension_coordinate);
+    let dim_pref = if c
+        .dims
+        .first()
+        .is_some_and(|d| d.eq_ignore_ascii_case("time"))
+    {
+        0
+    } else {
+        1
+    };
+    let sn = u8::from(!c.has_standard_name);
+    let units = u8::from(!c.has_units);
+    let referenced = u8::from(!c.is_referenced);
+    let depth = c.key.matches('/').count();
+    (kind, dim_pref, sn, units, referenced, depth)
+}
+
+fn select_best_vertical_axis(candidates: &[AxisCandidate]) -> Option<AxisCandidate> {
+    candidates
+        .iter()
+        .filter(|c| c.axis == 'Z' && c.dims.len() == 1)
+        .min_by(|a, b| {
+            rank_vertical_axis(a)
+                .cmp(&rank_vertical_axis(b))
+                .then_with(|| a.display.cmp(&b.display))
+        })
+        .cloned()
+}
+
+fn rank_vertical_axis(c: &AxisCandidate) -> (u8, u8, u8, u8, usize) {
+    let kind = u8::from(!c.is_dimension_coordinate);
+    let dim_pref = if c.dims.first().is_some_and(|d| {
+        d.eq_ignore_ascii_case("lev")
+            || d.eq_ignore_ascii_case("level")
+            || d.eq_ignore_ascii_case("plev")
+            || d.eq_ignore_ascii_case("depth")
+    }) {
+        0
+    } else {
+        1
+    };
+    let sn = u8::from(!c.has_standard_name);
+    let referenced = u8::from(!c.is_referenced);
+    let depth = c.key.matches('/').count();
+    (kind, dim_pref, sn, referenced, depth)
+}
+
+fn select_best_horizontal_axes(
+    candidates: &[AxisCandidate],
+) -> (
+    Option<AxisCandidate>,
+    Option<AxisCandidate>,
+    Option<(String, String)>,
+) {
+    // Prefer a matched 2D latitude/longitude pair with shared (y,x) dims.
+    let mut best_pair: Option<(&AxisCandidate, &AxisCandidate)> = None;
+
+    for y in candidates
+        .iter()
+        .filter(|c| c.axis == 'Y' && c.dims.len() == 2 && c.is_latitude)
+    {
+        for x in candidates
+            .iter()
+            .filter(|c| c.axis == 'X' && c.dims.len() == 2 && c.is_longitude)
+        {
+            if y.dims != x.dims {
+                continue;
+            }
+
+            best_pair = match best_pair {
+                None => Some((y, x)),
+                Some((by, bx)) => {
+                    if rank_lat_lon_pair(y, x) < rank_lat_lon_pair(by, bx) {
+                        Some((y, x))
+                    } else {
+                        Some((by, bx))
+                    }
+                }
+            };
+        }
+    }
+
+    if let Some((y, x)) = best_pair {
+        let dim_y = y.dims[0].clone();
+        let dim_x = y.dims[1].clone();
+
+        return (Some((*y).clone()), Some((*x).clone()), Some((dim_y, dim_x)));
+    }
+
+    // Otherwise, pick the best 1D Y and 1D X candidates.
+    let best_y = candidates
+        .iter()
+        .filter(|c| c.axis == 'Y' && c.dims.len() == 1)
+        .min_by(|a, b| {
+            rank_horizontal_1d('Y', a)
+                .cmp(&rank_horizontal_1d('Y', b))
+                .then_with(|| a.display.cmp(&b.display))
+        })
+        .cloned();
+
+    let best_x = candidates
+        .iter()
+        .filter(|c| c.axis == 'X' && c.dims.len() == 1)
+        .min_by(|a, b| {
+            rank_horizontal_1d('X', a)
+                .cmp(&rank_horizontal_1d('X', b))
+                .then_with(|| a.display.cmp(&b.display))
+        })
+        .cloned();
+
+    let plot_dims = match (&best_y, &best_x) {
+        (Some(y), Some(x)) => Some((y.dims[0].clone(), x.dims[0].clone())),
+        _ => None,
+    };
+
+    (best_y, best_x, plot_dims)
+}
+
+fn rank_lat_lon_pair<'a>(
+    lat: &'a AxisCandidate,
+    lon: &'a AxisCandidate,
+) -> (u8, usize, usize, &'a str, &'a str) {
+    let referenced = u8::from(!(lat.is_referenced && lon.is_referenced));
+    let depth = lat.key.matches('/').count() + lon.key.matches('/').count();
+    let dimy = lat.dims.first().map(String::as_str).unwrap_or("");
+    let dimx = lat.dims.get(1).map(String::as_str).unwrap_or("");
+    (
+        referenced,
+        depth,
+        lat.display.len() + lon.display.len(),
+        dimy,
+        dimx,
+    )
+}
+
+fn rank_horizontal_1d(axis: char, c: &AxisCandidate) -> (u8, u8, u8, u8, u8, usize) {
+    let kind = u8::from(!c.is_dimension_coordinate);
+
+    let dim_pref = match axis {
+        'Y' => {
+            let d = c.dims.first().map(String::as_str).unwrap_or("");
+            if d.eq_ignore_ascii_case("lat") || d.eq_ignore_ascii_case("latitude") {
+                0
+            } else if d.eq_ignore_ascii_case("y") {
+                1
+            } else {
+                2
+            }
+        }
+        'X' => {
+            let d = c.dims.first().map(String::as_str).unwrap_or("");
+            if d.eq_ignore_ascii_case("lon") || d.eq_ignore_ascii_case("longitude") {
+                0
+            } else if d.eq_ignore_ascii_case("x") {
+                1
+            } else {
+                2
+            }
+        }
+        _ => 2,
+    };
+
+    let sn = u8::from(!c.has_standard_name);
+    let units = u8::from(!c.has_units);
+    let referenced = u8::from(!c.is_referenced);
+    let depth = c.key.matches('/').count();
+
+    (kind, dim_pref, sn, units, referenced, depth)
+}
+
+fn collect_whitespace_separated_references(
+    metadata: &ZarrMetadata,
+    attr_name: &str,
+) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+
+    for (path, var) in &metadata.variables {
+        let Some(AttributeValue::String(raw)) = var.attributes.get(attr_name) else {
+            continue;
+        };
+
+        for name in raw.split_whitespace() {
+            if let Some((ref_path, _ref_var)) = resolve_related_var(metadata, path, name) {
+                out.insert(ref_path.clone());
+            }
+        }
+    }
+
+    out
+}
+
+fn collect_cell_measures_references(metadata: &ZarrMetadata) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+
+    for (path, var) in &metadata.variables {
+        let Some(AttributeValue::String(raw)) = var.attributes.get("cell_measures") else {
+            continue;
+        };
+
+        let (pairs, _warnings) = parse_colon_pairs(raw);
+        for (_measure, name) in pairs {
+            if let Some((ref_path, _ref_var)) = resolve_related_var(metadata, path, &name) {
+                out.insert(ref_path.clone());
+            }
+        }
+    }
+
+    out
+}
+
+fn collect_bounds_references(metadata: &ZarrMetadata) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+
+    for (path, var) in &metadata.variables {
+        let Some(AttributeValue::String(bounds_name)) = var.attributes.get("bounds") else {
+            continue;
+        };
+
+        if let Some((bounds_path, _bounds_var)) = resolve_related_var(metadata, path, bounds_name) {
+            out.insert(bounds_path.clone());
+        }
+    }
+
+    out
+}
+
 fn approx_num_elements(shape: &[u64]) -> u128 {
     shape
         .iter()
@@ -283,72 +601,6 @@ fn find_dimension_name(metadata: &ZarrMetadata, preferred: &[&str]) -> Option<St
     }
 
     None
-}
-
-fn best_axis_candidate(axis: char, candidates: &[CfAxisSummary]) -> Option<CfAxisSummary> {
-    let mut best: Option<&CfAxisSummary> = None;
-    for cand in candidates.iter().filter(|c| c.axis == axis) {
-        best = match best {
-            None => Some(cand),
-            Some(current) => {
-                if axis_candidate_rank(axis, cand) < axis_candidate_rank(axis, current) {
-                    Some(cand)
-                } else {
-                    Some(current)
-                }
-            }
-        };
-    }
-
-    best.cloned()
-}
-
-fn axis_candidate_rank(axis: char, cand: &CfAxisSummary) -> (u8, usize, &str) {
-    let pref = axis_preference(axis, &cand.dim);
-    let depth = cand.coord_var.matches('/').count();
-    (pref, depth, cand.coord_var.as_str())
-}
-
-fn axis_preference(axis: char, dim: &str) -> u8 {
-    match axis {
-        'T' => {
-            if dim.eq_ignore_ascii_case("time") {
-                0
-            } else {
-                1
-            }
-        }
-        'Y' => {
-            if dim.eq_ignore_ascii_case("lat") || dim.eq_ignore_ascii_case("latitude") {
-                0
-            } else if dim.eq_ignore_ascii_case("y") {
-                1
-            } else {
-                2
-            }
-        }
-        'X' => {
-            if dim.eq_ignore_ascii_case("lon") || dim.eq_ignore_ascii_case("longitude") {
-                0
-            } else if dim.eq_ignore_ascii_case("x") {
-                1
-            } else {
-                2
-            }
-        }
-        'Z' => {
-            if dim.eq_ignore_ascii_case("lev")
-                || dim.eq_ignore_ascii_case("level")
-                || dim.eq_ignore_ascii_case("plev")
-                || dim.eq_ignore_ascii_case("depth")
-            {
-                0
-            } else {
-                1
-            }
-        }
-        _ => 1,
-    }
 }
 
 fn check_global_conventions(metadata: &ZarrMetadata, report: &mut CfReport) {
@@ -534,7 +786,15 @@ async fn check_coordinate_variables(
             }
 
             match var.attributes.get("calendar") {
-                Some(AttributeValue::String(_)) | None => {}
+                Some(AttributeValue::String(cal)) => {
+                    if !is_known_cf_calendar(cal) {
+                        report.warn(format!(
+                            "Time coordinate variable '{}' has unrecognized calendar='{}' (expected e.g. 'standard', 'gregorian', 'proleptic_gregorian', 'noleap', '360_day').",
+                            coord_label, cal
+                        ));
+                    }
+                }
+                None => {}
                 Some(other) => report.warn(format!(
                     "Time coordinate variable '{}' has non-string 'calendar' attribute: {}",
                     coord_label,
@@ -687,9 +947,23 @@ fn check_dimensions_have_coordinates(
     report: &mut CfReport,
 ) {
     let mut dims_with_coord: HashSet<String> = HashSet::new();
+
+    // Coordinate variables (strict CF coordinate vars: 1D, name == dim name)
     for (_path, var) in coord_vars {
         if let Some(dim) = var.dimensions.first() {
             dims_with_coord.insert(dim.name.clone());
+        }
+    }
+
+    // Auxiliary coordinates referenced via `coordinates` also provide coordinate values for their dims
+    // (e.g. curvilinear lat(y,x)/lon(y,x) for y/x).
+    for coord_path in collect_coordinate_references(metadata) {
+        let Some(coord_var) = metadata.variables.get(&coord_path) else {
+            continue;
+        };
+
+        for d in &coord_var.dimensions {
+            dims_with_coord.insert(d.name.clone());
         }
     }
 
@@ -796,21 +1070,585 @@ fn check_grid_mappings(metadata: &ZarrMetadata, report: &mut CfReport) {
 
 fn check_coordinates_attribute_refs(metadata: &ZarrMetadata, report: &mut CfReport) {
     for (path, var) in &metadata.variables {
-        let Some(AttributeValue::String(coords)) = var.attributes.get("coordinates") else {
+        let Some(attr) = var.attributes.get("coordinates") else {
             continue;
         };
 
+        let coords = match attr {
+            AttributeValue::String(s) => s.trim(),
+            other => {
+                report.warn(format!(
+                    "Variable '{}' has non-string 'coordinates' attribute: {}",
+                    display_var_path(path, var),
+                    describe_attr_value(other)
+                ));
+                continue;
+            }
+        };
+
+        if coords.is_empty() {
+            report.warn(format!(
+                "Variable '{}' has an empty 'coordinates' attribute.",
+                display_var_path(path, var)
+            ));
+            continue;
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
         for name in coords.split_whitespace() {
-            if resolve_related_var(metadata, path, name).is_none() {
+            if !seen.insert(name) {
+                report.warn(format!(
+                    "Variable '{}' lists coordinate '{}' multiple times in coordinates='{}'.",
+                    display_var_path(path, var),
+                    name,
+                    coords
+                ));
+            }
+
+            let Some((coord_path, coord_var)) = resolve_related_var(metadata, path, name) else {
                 report.warn(format!(
                     "Variable '{}' lists coordinates='{}' but '{}' was not found.",
                     display_var_path(path, var),
                     coords,
                     name
                 ));
+                continue;
+            };
+
+            check_var_dims_compatible(report, "coordinates", path, var, coord_path, coord_var);
+        }
+    }
+}
+
+fn check_ancillary_variables_attribute_refs(metadata: &ZarrMetadata, report: &mut CfReport) {
+    for (path, var) in &metadata.variables {
+        let Some(attr) = var.attributes.get("ancillary_variables") else {
+            continue;
+        };
+
+        let vars = match attr {
+            AttributeValue::String(s) => s.trim(),
+            other => {
+                report.warn(format!(
+                    "Variable '{}' has non-string 'ancillary_variables' attribute: {}",
+                    display_var_path(path, var),
+                    describe_attr_value(other)
+                ));
+                continue;
+            }
+        };
+
+        if vars.is_empty() {
+            report.warn(format!(
+                "Variable '{}' has an empty 'ancillary_variables' attribute.",
+                display_var_path(path, var)
+            ));
+            continue;
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for name in vars.split_whitespace() {
+            if !seen.insert(name) {
+                report.warn(format!(
+                    "Variable '{}' lists ancillary variable '{}' multiple times in ancillary_variables='{}'.",
+                    display_var_path(path, var),
+                    name,
+                    vars
+                ));
+            }
+
+            let Some((anc_path, anc_var)) = resolve_related_var(metadata, path, name) else {
+                report.warn(format!(
+                    "Variable '{}' lists ancillary_variables='{}' but '{}' was not found.",
+                    display_var_path(path, var),
+                    vars,
+                    name
+                ));
+                continue;
+            };
+
+            check_var_dims_compatible(report, "ancillary_variables", path, var, anc_path, anc_var);
+        }
+    }
+}
+
+fn check_cell_measures_attribute(metadata: &ZarrMetadata, report: &mut CfReport) {
+    for (path, var) in &metadata.variables {
+        let Some(attr) = var.attributes.get("cell_measures") else {
+            continue;
+        };
+
+        let raw = match attr {
+            AttributeValue::String(s) => s.trim(),
+            other => {
+                report.warn(format!(
+                    "Variable '{}' has non-string 'cell_measures' attribute: {}",
+                    display_var_path(path, var),
+                    describe_attr_value(other)
+                ));
+                continue;
+            }
+        };
+
+        if raw.is_empty() {
+            report.warn(format!(
+                "Variable '{}' has an empty 'cell_measures' attribute.",
+                display_var_path(path, var)
+            ));
+            continue;
+        }
+
+        let (pairs, warnings) = parse_colon_pairs(raw);
+        for w in warnings {
+            report.warn(format!(
+                "Variable '{}' has cell_measures='{}': {}",
+                display_var_path(path, var),
+                raw,
+                w
+            ));
+        }
+
+        if pairs.is_empty() {
+            report.warn(format!(
+                "Variable '{}' has cell_measures='{}' but no (measure: variable) pairs could be parsed.",
+                display_var_path(path, var),
+                raw
+            ));
+            continue;
+        }
+
+        for (measure, name) in pairs {
+            let Some((m_path, m_var)) = resolve_related_var(metadata, path, &name) else {
+                report.warn(format!(
+                    "Variable '{}' has cell_measures='{}' but referenced measure var '{}' (for '{}') was not found.",
+                    display_var_path(path, var),
+                    raw,
+                    name,
+                    measure
+                ));
+                continue;
+            };
+
+            check_var_dims_compatible(report, "cell_measures", path, var, m_path, m_var);
+        }
+    }
+}
+
+fn check_cell_methods_attribute(metadata: &ZarrMetadata, report: &mut CfReport) {
+    for (path, var) in &metadata.variables {
+        let Some(attr) = var.attributes.get("cell_methods") else {
+            continue;
+        };
+
+        let raw = match attr {
+            AttributeValue::String(s) => s.trim(),
+            other => {
+                report.warn(format!(
+                    "Variable '{}' has non-string 'cell_methods' attribute: {}",
+                    display_var_path(path, var),
+                    describe_attr_value(other)
+                ));
+                continue;
+            }
+        };
+
+        if raw.is_empty() {
+            report.warn(format!(
+                "Variable '{}' has an empty 'cell_methods' attribute.",
+                display_var_path(path, var)
+            ));
+            continue;
+        }
+
+        for axis in extract_cell_methods_axes(raw) {
+            if axis.eq_ignore_ascii_case("interval") || axis.eq_ignore_ascii_case("comment") {
+                continue;
+            }
+
+            if axis.eq_ignore_ascii_case("area") || axis.eq_ignore_ascii_case("volume") {
+                continue;
+            }
+
+            let axis_is_dim = var
+                .dimensions
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&axis))
+                || metadata
+                    .dimensions
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(&axis));
+
+            if !axis_is_dim {
+                report.warn(format!(
+                    "Variable '{}' has cell_methods='{}' but '{}' is not a known dimension name.",
+                    display_var_path(path, var),
+                    raw,
+                    axis
+                ));
             }
         }
     }
+}
+
+fn check_parametric_vertical_coordinates(metadata: &ZarrMetadata, report: &mut CfReport) {
+    for (path, var) in &metadata.variables {
+        let Some(AttributeValue::String(sn)) = var.attributes.get("standard_name") else {
+            continue;
+        };
+
+        if !is_parametric_vertical_standard_name(sn) {
+            continue;
+        }
+
+        match var.attributes.get("formula_terms") {
+            Some(AttributeValue::String(ft)) => {
+                let ft = ft.trim();
+                if ft.is_empty() {
+                    report.warn(format!(
+                        "Parametric vertical coordinate variable '{}' (standard_name='{}') has empty formula_terms.",
+                        display_var_path(path, var),
+                        sn
+                    ));
+                    continue;
+                }
+
+                let (pairs, warnings) = parse_colon_pairs(ft);
+                for w in warnings {
+                    report.warn(format!(
+                        "Parametric vertical coordinate variable '{}' formula_terms='{}': {}",
+                        display_var_path(path, var),
+                        ft,
+                        w
+                    ));
+                }
+
+                if pairs.is_empty() {
+                    report.warn(format!(
+                        "Parametric vertical coordinate variable '{}' formula_terms='{}' but no (term: variable) pairs could be parsed.",
+                        display_var_path(path, var),
+                        ft
+                    ));
+                    continue;
+                }
+
+                for (_term, name) in pairs {
+                    if resolve_related_var(metadata, path, &name).is_none() {
+                        report.warn(format!(
+                            "Parametric vertical coordinate variable '{}' formula_terms references '{}' which was not found.",
+                            display_var_path(path, var),
+                            name
+                        ));
+                    }
+                }
+            }
+            Some(other) => report.warn(format!(
+                "Parametric vertical coordinate variable '{}' (standard_name='{}') has non-string formula_terms: {}",
+                display_var_path(path, var),
+                sn,
+                describe_attr_value(other)
+            )),
+            None => report.warn(format!(
+                "Parametric vertical coordinate variable '{}' (standard_name='{}') is missing formula_terms.",
+                display_var_path(path, var),
+                sn
+            )),
+        }
+    }
+}
+
+fn check_lat_lon_variables(store: &ZarrStore, metadata: &ZarrMetadata, report: &mut CfReport) {
+    let coord_vars = find_coordinate_variables(metadata);
+    let coord_paths: HashSet<&str> = coord_vars.iter().map(|(p, _)| p.as_str()).collect();
+
+    let referenced: HashSet<String> = collect_coordinate_references(metadata);
+
+    for (path, var) in &metadata.variables {
+        let standard_name = attr_string(var, "standard_name");
+        let units = attr_string(var, "units");
+
+        let is_lat = is_latitude_coordinate(standard_name, units);
+        let is_lon = is_longitude_coordinate(standard_name, units);
+        if !is_lat && !is_lon {
+            continue;
+        }
+
+        // Avoid duplicating the 1D dimension-coordinate checks.
+        if coord_paths.contains(path.as_str()) && var.dimensions.len() == 1 {
+            continue;
+        }
+
+        let kind = if is_lat { "Latitude" } else { "Longitude" };
+        let label = display_var_path(path, var);
+
+        match var.attributes.get("units") {
+            Some(AttributeValue::String(_)) => {}
+            Some(other) => report.warn(format!(
+                "{} variable '{}' has non-string 'units' attribute: {}",
+                kind,
+                label,
+                describe_attr_value(other)
+            )),
+            None => report.warn(format!(
+                "{} variable '{}' is missing 'units' attribute.",
+                kind, label
+            )),
+        }
+
+        if var.shape.is_empty() {
+            continue;
+        }
+
+        let missing_values = collect_missing_values_f64(var);
+        let ranges = sample_ranges_for_lat_lon(var);
+        if ranges.is_empty() {
+            continue;
+        }
+
+        match store.read_array_subset_f64(var, &ranges) {
+            Ok(data) => {
+                if let Some((min, max)) = sample_min_max(&data, &missing_values) {
+                    if is_lat && (min < -90.0 - 1e-6 || max > 90.0 + 1e-6) {
+                        report.warn(format!(
+                            "Latitude variable '{}' sample range [{:.6}, {:.6}] looks out of bounds for degrees_north.",
+                            label, min, max
+                        ));
+                    }
+
+                    if is_lon && (min < -360.0 - 1e-6 || max > 360.0 + 1e-6) {
+                        report.warn(format!(
+                            "Longitude variable '{}' sample range [{:.6}, {:.6}] looks out of bounds for degrees_east.",
+                            label, min, max
+                        ));
+                    }
+                }
+            }
+            Err(err) => report.warn(format!(
+                "Skipping {} range check for '{}' ({}): {}",
+                kind, var.name, label, err
+            )),
+        }
+
+        if var.dimensions.len() >= 2 && !referenced.contains(path) {
+            report.warn(format!(
+                "{} variable '{}' is not referenced by any variable via the 'coordinates' attribute.",
+                kind,
+                label
+            ));
+        }
+    }
+}
+
+fn check_var_dims_compatible(
+    report: &mut CfReport,
+    attr_name: &str,
+    parent_path: &str,
+    parent: &Variable,
+    child_path: &str,
+    child: &Variable,
+) {
+    // Dimension compatibility: referenced var dims should be a subset of the parent dims.
+    let mut missing: Vec<String> = Vec::new();
+    for d in &child.dimensions {
+        if find_dim_size(parent, &d.name).is_none() {
+            missing.push(d.name.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        report.warn(format!(
+            "Variable '{}' attribute '{}' references '{}' but referenced var dims ({}) are not a subset of variable dims ({}).",
+            display_var_path(parent_path, parent),
+            attr_name,
+            display_var_path(child_path, child),
+            missing.join(", "),
+            parent
+                .dimensions
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return;
+    }
+
+    // Size compatibility for shared dims.
+    for d in &child.dimensions {
+        let Some((_parent_dim, parent_size)) = find_dim_size(parent, &d.name) else {
+            continue;
+        };
+
+        if d.size > 0 && parent_size > 0 && d.size != parent_size {
+            report.warn(format!(
+                "Referenced variable '{}' dim '{}' has size {} but variable '{}' dim '{}' has size {}.",
+                display_var_path(child_path, child),
+                d.name,
+                d.size,
+                display_var_path(parent_path, parent),
+                d.name,
+                parent_size
+            ));
+        }
+    }
+}
+
+fn collect_coordinate_references(metadata: &ZarrMetadata) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+
+    for (path, var) in &metadata.variables {
+        let Some(AttributeValue::String(coords)) = var.attributes.get("coordinates") else {
+            continue;
+        };
+
+        for name in coords.split_whitespace() {
+            if let Some((coord_path, _coord_var)) = resolve_related_var(metadata, path, name) {
+                out.insert(coord_path.clone());
+            }
+        }
+    }
+
+    out
+}
+
+fn sample_ranges_for_lat_lon(var: &Variable) -> Vec<std::ops::Range<u64>> {
+    let ndim = var.shape.len();
+    if ndim == 0 {
+        return Vec::new();
+    }
+
+    let limit_1d: u64 = 10_000;
+    let limit_2d: u64 = 100;
+
+    let mut ranges = Vec::with_capacity(ndim);
+    for (i, &n) in var.shape.iter().enumerate() {
+        let limit = if ndim == 1 {
+            limit_1d
+        } else if ndim == 2 {
+            limit_2d
+        } else if i + 2 < ndim {
+            1
+        } else {
+            limit_2d
+        };
+
+        let end = n.min(limit);
+        if end == 0 {
+            return Vec::new();
+        }
+
+        ranges.push(0..end);
+    }
+
+    ranges
+}
+
+fn is_parametric_vertical_standard_name(standard_name: &str) -> bool {
+    standard_name.eq_ignore_ascii_case("atmosphere_hybrid_sigma_pressure_coordinate")
+        || standard_name.eq_ignore_ascii_case("atmosphere_hybrid_height_coordinate")
+        || standard_name.eq_ignore_ascii_case("atmosphere_sigma_coordinate")
+        || standard_name.eq_ignore_ascii_case("ocean_sigma_coordinate")
+        || standard_name.eq_ignore_ascii_case("ocean_sigma_z_coordinate")
+        || standard_name.eq_ignore_ascii_case("ocean_s_coordinate")
+        || standard_name.eq_ignore_ascii_case("ocean_s_coordinate_g1")
+        || standard_name.eq_ignore_ascii_case("ocean_s_coordinate_g2")
+        || standard_name.eq_ignore_ascii_case("ocean_double_sigma_coordinate")
+}
+
+fn parse_colon_pairs(s: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let mut pending_key: Option<String> = None;
+
+    for token in s.split_whitespace() {
+        if let Some(key) = pending_key.take() {
+            out.push((key, token.to_string()));
+            continue;
+        }
+
+        let Some((k, v)) = token.split_once(':') else {
+            warnings.push(format!(
+                "Unexpected token '{}' (expected '<key>:' or '<key>:<value>')",
+                token
+            ));
+            continue;
+        };
+
+        let key = k.trim();
+        let value = v.trim();
+
+        if key.is_empty() {
+            warnings.push(format!("Empty key in token '{}'", token));
+            continue;
+        }
+
+        if value.is_empty() {
+            pending_key = Some(key.to_string());
+            continue;
+        }
+
+        out.push((key.to_string(), value.to_string()));
+    }
+
+    if let Some(key) = pending_key {
+        warnings.push(format!("Dangling key '{}' with no value", key));
+    }
+
+    (out, warnings)
+}
+
+fn extract_cell_methods_axes(cell_methods: &str) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+
+    for token in cell_methods.split_whitespace() {
+        let clean = token.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';'));
+
+        if let Some(axis) = clean.strip_suffix(':') {
+            if !axis.is_empty() {
+                out.insert(axis.to_string());
+            }
+            continue;
+        }
+
+        if let Some((axis, rest)) = clean.split_once(':') {
+            if !axis.is_empty() && !rest.is_empty() {
+                out.insert(axis.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+fn find_dim_size<'a>(var: &'a Variable, dim_name: &str) -> Option<(&'a str, u64)> {
+    for d in &var.dimensions {
+        if d.name == dim_name {
+            return Some((d.name.as_str(), d.size));
+        }
+    }
+
+    for d in &var.dimensions {
+        if d.name.eq_ignore_ascii_case(dim_name) {
+            return Some((d.name.as_str(), d.size));
+        }
+    }
+
+    None
+}
+
+fn is_known_cf_calendar(calendar: &str) -> bool {
+    let cal = calendar.trim().to_ascii_lowercase();
+    matches!(
+        cal.as_str(),
+        "standard"
+            | "gregorian"
+            | "proleptic_gregorian"
+            | "julian"
+            | "noleap"
+            | "365_day"
+            | "all_leap"
+            | "366_day"
+            | "360_day"
+    )
 }
 
 fn resolve_related_var<'a>(
@@ -1099,6 +1937,22 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn make_var(name: &str, shape: Vec<u64>) -> Variable {
+        Variable {
+            name: name.to_string(),
+            path: name.to_string(),
+            dtype: "<f8".to_string(),
+            shape: shape.clone(),
+            chunks: shape,
+            compressor: None,
+            fill_value: None,
+            order: "C".to_string(),
+            filters: vec![],
+            attributes: HashMap::new(),
+            dimensions: vec![],
+        }
+    }
+
     #[test]
     fn test_monotonic_direction() {
         assert_eq!(
@@ -1158,37 +2012,250 @@ mod tests {
     }
 
     #[test]
+    fn test_is_known_cf_calendar() {
+        assert!(is_known_cf_calendar("standard"));
+        assert!(is_known_cf_calendar("gregorian"));
+        assert!(is_known_cf_calendar("proleptic_gregorian"));
+        assert!(is_known_cf_calendar("noleap"));
+        assert!(is_known_cf_calendar("365_day"));
+        assert!(is_known_cf_calendar("360_day"));
+
+        assert!(!is_known_cf_calendar("custom_calendar"));
+    }
+
+    #[test]
+    fn test_parse_colon_pairs() {
+        let (pairs, warnings) = parse_colon_pairs("area: areacella volume: volcello");
+        assert!(warnings.is_empty());
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("area".to_string(), "areacella".to_string()));
+        assert_eq!(pairs[1], ("volume".to_string(), "volcello".to_string()));
+
+        let (pairs, warnings) = parse_colon_pairs("a: a b: b ps: ps p0: p0");
+        assert!(warnings.is_empty());
+        assert_eq!(pairs.len(), 4);
+
+        let (pairs, warnings) = parse_colon_pairs("area:");
+        assert!(pairs.is_empty());
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_cell_methods_axes() {
+        let axes =
+            extract_cell_methods_axes("time: mean (interval: 1 month) area: mean comment: hi");
+        assert!(axes.contains("time"));
+        assert!(axes.contains("interval"));
+        assert!(axes.contains("area"));
+        assert!(axes.contains("comment"));
+    }
+
+    #[test]
+    fn test_is_parametric_vertical_standard_name() {
+        assert!(is_parametric_vertical_standard_name(
+            "atmosphere_hybrid_sigma_pressure_coordinate"
+        ));
+        assert!(is_parametric_vertical_standard_name("ocean_s_coordinate"));
+        assert!(!is_parametric_vertical_standard_name("air_pressure"));
+    }
+
+    #[test]
+    fn test_cf_summary_curvilinear_lat_lon_prefers_yx_plot_dims_and_no_dim_coord_warnings() {
+        let mut md = ZarrMetadata::new();
+
+        // time(time)
+        let mut time = make_var("time", vec![3]);
+        time.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![AttributeValue::String("time".to_string())]),
+        );
+        time.attributes.insert(
+            "standard_name".to_string(),
+            AttributeValue::String("time".to_string()),
+        );
+        time.attributes.insert(
+            "units".to_string(),
+            AttributeValue::String("days since 2000-01-01".to_string()),
+        );
+        md.variables.insert("time".to_string(), time);
+
+        // nav_lat(y,x), nav_lon(y,x)
+        let mut nav_lat = make_var("nav_lat", vec![4, 5]);
+        nav_lat.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![
+                AttributeValue::String("y".to_string()),
+                AttributeValue::String("x".to_string()),
+            ]),
+        );
+        nav_lat.attributes.insert(
+            "standard_name".to_string(),
+            AttributeValue::String("latitude".to_string()),
+        );
+        nav_lat.attributes.insert(
+            "units".to_string(),
+            AttributeValue::String("degrees_north".to_string()),
+        );
+        md.variables.insert("nav_lat".to_string(), nav_lat);
+
+        let mut nav_lon = make_var("nav_lon", vec![4, 5]);
+        nav_lon.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![
+                AttributeValue::String("y".to_string()),
+                AttributeValue::String("x".to_string()),
+            ]),
+        );
+        nav_lon.attributes.insert(
+            "standard_name".to_string(),
+            AttributeValue::String("longitude".to_string()),
+        );
+        nav_lon.attributes.insert(
+            "units".to_string(),
+            AttributeValue::String("degrees_east".to_string()),
+        );
+        md.variables.insert("nav_lon".to_string(), nav_lon);
+
+        // temperature(time,y,x) with auxiliary coords
+        let mut temperature = make_var("temperature", vec![3, 4, 5]);
+        temperature.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![
+                AttributeValue::String("time".to_string()),
+                AttributeValue::String("y".to_string()),
+                AttributeValue::String("x".to_string()),
+            ]),
+        );
+        temperature.attributes.insert(
+            "coordinates".to_string(),
+            AttributeValue::String("nav_lat nav_lon".to_string()),
+        );
+        md.variables.insert("temperature".to_string(), temperature);
+
+        md.infer_dimensions();
+
+        let summary = cf_summary(&md);
+
+        assert_eq!(
+            summary.suggested_plot_dims,
+            Some(("y".to_string(), "x".to_string()))
+        );
+        assert_eq!(summary.suggested_slice_dims, vec!["time".to_string()]);
+        assert!(
+            summary
+                .candidate_data_vars
+                .contains(&"temperature".to_string())
+        );
+
+        let y_axis = summary.axes.iter().find(|a| a.axis == 'Y').unwrap();
+        assert_eq!(y_axis.dims, vec!["y".to_string(), "x".to_string()]);
+        assert_eq!(y_axis.coord_var, "nav_lat".to_string());
+
+        let x_axis = summary.axes.iter().find(|a| a.axis == 'X').unwrap();
+        assert_eq!(x_axis.dims, vec!["y".to_string(), "x".to_string()]);
+        assert_eq!(x_axis.coord_var, "nav_lon".to_string());
+
+        let coord_vars = find_coordinate_variables(&md);
+        let mut report = CfReport::default();
+        check_dimensions_have_coordinates(&md, &coord_vars, &mut report);
+
+        assert_eq!(
+            report.warnings,
+            0,
+            "unexpected warnings: {:?}",
+            report
+                .issues
+                .iter()
+                .map(|i| i.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_cf_summary_rectilinear_lat_lon_suggests_lat_lon_plot_dims() {
+        let mut md = ZarrMetadata::new();
+
+        let mut time = make_var("time", vec![3]);
+        time.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![AttributeValue::String("time".to_string())]),
+        );
+        time.attributes.insert(
+            "standard_name".to_string(),
+            AttributeValue::String("time".to_string()),
+        );
+        time.attributes.insert(
+            "units".to_string(),
+            AttributeValue::String("days since 2000-01-01".to_string()),
+        );
+        md.variables.insert("time".to_string(), time);
+
+        let mut lat = make_var("lat", vec![4]);
+        lat.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![AttributeValue::String("lat".to_string())]),
+        );
+        lat.attributes.insert(
+            "standard_name".to_string(),
+            AttributeValue::String("latitude".to_string()),
+        );
+        lat.attributes.insert(
+            "units".to_string(),
+            AttributeValue::String("degrees_north".to_string()),
+        );
+        md.variables.insert("lat".to_string(), lat);
+
+        let mut lon = make_var("lon", vec![5]);
+        lon.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![AttributeValue::String("lon".to_string())]),
+        );
+        lon.attributes.insert(
+            "standard_name".to_string(),
+            AttributeValue::String("longitude".to_string()),
+        );
+        lon.attributes.insert(
+            "units".to_string(),
+            AttributeValue::String("degrees_east".to_string()),
+        );
+        md.variables.insert("lon".to_string(), lon);
+
+        let mut temperature = make_var("temperature", vec![3, 4, 5]);
+        temperature.attributes.insert(
+            "_ARRAY_DIMENSIONS".to_string(),
+            AttributeValue::Array(vec![
+                AttributeValue::String("time".to_string()),
+                AttributeValue::String("lat".to_string()),
+                AttributeValue::String("lon".to_string()),
+            ]),
+        );
+        md.variables.insert("temperature".to_string(), temperature);
+
+        md.infer_dimensions();
+
+        let summary = cf_summary(&md);
+
+        assert_eq!(
+            summary.suggested_plot_dims,
+            Some(("lat".to_string(), "lon".to_string()))
+        );
+        assert_eq!(summary.suggested_slice_dims, vec!["time".to_string()]);
+        assert!(
+            summary
+                .candidate_data_vars
+                .contains(&"temperature".to_string())
+        );
+    }
+
+    #[test]
     fn test_resolve_related_var_root_and_group() {
         let mut md = ZarrMetadata::new();
 
-        let v_root = Variable {
-            name: "time".to_string(),
-            path: "time".to_string(),
-            dtype: "<f8".to_string(),
-            shape: vec![10],
-            chunks: vec![10],
-            compressor: None,
-            fill_value: None,
-            order: "C".to_string(),
-            filters: vec![],
-            attributes: HashMap::new(),
-            dimensions: vec![],
-        };
+        let v_root = make_var("time", vec![10]);
         md.variables.insert("time".to_string(), v_root);
 
-        let v_group = Variable {
-            name: "lat".to_string(),
-            path: "grp/lat".to_string(),
-            dtype: "<f8".to_string(),
-            shape: vec![10],
-            chunks: vec![10],
-            compressor: None,
-            fill_value: None,
-            order: "C".to_string(),
-            filters: vec![],
-            attributes: HashMap::new(),
-            dimensions: vec![],
-        };
+        let mut v_group = make_var("lat", vec![10]);
+        v_group.path = "grp/lat".to_string();
         md.variables.insert("grp/lat".to_string(), v_group);
 
         assert!(resolve_related_var(&md, "temp", "time").is_some());

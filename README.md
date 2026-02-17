@@ -1,17 +1,27 @@
-# Zarr Summary Tool
+# zarr-dump
 
-A command-line tool for inspecting and summarizing Zarr store metadata, displaying information in a familiar NetCDF-style format.
+A CLI tool for inspecting Zarr v2/v3 stores and printing their metadata in a familiar NetCDF-style header format (similar to `ncdump -h`).
+
+It also includes CF-focused tooling aimed at climate/ocean/atmosphere/land datasets: a `cf-check` subcommand and a `// CF summary:` section in the default output.
 
 ## Features
 
-- **NetCDF-Style Output**: Displays Zarr metadata in the familiar `ncdump -h` format
-- **Zarr v2 and v3 Support**: Works with both Zarr v2 and v3 stores
-- **Consolidated Metadata Support**: Efficiently reads `.zmetadata` (v2) or `zarr.json` (v3) files when available
-- **Hierarchical Fallback**: Gracefully falls back to scanning individual metadata files
-- **Dimension Inference**: Automatically detects dimensions and identifies unlimited dimensions
-- **Complete Metadata**: Extracts all store information including attributes, data types, and compression settings
-- **Colored Output**: Optional syntax highlighting for improved readability
-- **2D Slice Plotting**: Plot a 2D slice of array data in an interactive window (`--plot ... --plot-dims ... --slice ...`)
+- **NetCDF-style metadata output** (dimensions, variables, attributes)
+- **Zarr v2 and v3 support**
+  - Reads consolidated metadata when present (`.zmetadata` for v2, or `consolidated_metadata` in v3 `zarr.json`)
+  - Falls back to hierarchical scanning when consolidated metadata isn’t available
+- **Dimension inference** (from `_ARRAY_DIMENSIONS` / `dimension_names`) and **unlimited dimension detection**
+- **CF conventions tooling**
+  - **CF summary** in the default dump output:
+    - Detects axes (T/Z/Y/X) and works with both rectilinear and curvilinear grids (e.g. 2D `lat(y,x)` / `lon(y,x)` referenced via `coordinates`)
+    - Suggests plot dims and slice dims
+    - Lists candidate data variables (excluding coordinate-like variables)
+  - **`cf-check` subcommand** with metadata + light-touch coordinate checks (exits non-zero if any errors are found)
+- **Coordinate data display** (`-c/--coordinate-data`, like `ncdump -c`) for 1D coordinate variables (best-effort)
+- **2D slice plotting** in an interactive window (viridis colormap)
+  - `zarr-dump STORE --plot VAR --plot-dims dim_y,dim_x --slice dim=index ...`
+  - Optional in-window navigation for non-plotted dimensions
+- **Optional colored output** (`--no-color` to disable)
 
 ## Installation
 
@@ -23,7 +33,15 @@ cd zarr-dump
 cargo build --release
 ```
 
-### Basic Usage
+Install locally (optional):
+
+```bash
+cargo install --path .
+```
+
+## Usage
+
+### Dump metadata (default mode)
 
 ```bash
 # Inspect a Zarr store
@@ -32,164 +50,122 @@ zarr-dump /path/to/zarr/store
 # Disable colored output
 zarr-dump /path/to/zarr/store --no-color
 
-# Plot a 2D slice (e.g. lat/lon at a fixed time index)
-zarr-dump /path/to/zarr/store --plot temperature --plot-dims lat,lon --slice time=0
+# Include coordinate variable values (like ncdump -c)
+zarr-dump /path/to/zarr/store -c
 ```
 
-### Example: Climate Data with Hierarchical Metadata
+The default output includes:
+- `dimensions:`
+- `variables:`
+- `// global attributes:`
+- `// CF summary:`
+- optional `data:` (when `-c/--coordinate-data` is set)
 
-For a typical climate dataset with temperature and pressure arrays:
+### CF checks
 
 ```bash
-zarr-dump ./climate_data/
+# Run CF-focused checks (exits non-zero if any ERRORs are present)
+zarr-dump cf-check /path/to/zarr/store
 ```
 
-Output:
+Checks include (high level):
+- `Conventions`/`conventions` presence and CF-like content
+- Dimension name list validation (`_ARRAY_DIMENSIONS` / `dimension_names`)
+- Coordinate-variable checks (units type, bounds references, sampled monotonicity where readable)
+- Time/vertical/lat/lon semantics checks (e.g. CF-style time units, calendar values, `positive`, lat/lon ranges)
+- Reference attribute checks (`coordinates`, `ancillary_variables`, `cell_measures`, `cell_methods`, `grid_mapping`, `formula_terms`)
+- Auxiliary 2D lat/lon detection and validation (including whether they’re referenced via `coordinates`)
+
+### Plot a 2D slice
+
+```bash
+# Plot a 2D slice of a variable (requires exactly 2 plotted dims)
+# Provide --slice for every remaining dimension not included in --plot-dims.
+zarr-dump /path/to/zarr/store \
+  --plot temperature \
+  --plot-dims y,x \
+  --slice time=0
 ```
+
+If the variable has extra dimensions (beyond the two plotted dims), the viewer supports interactive navigation:
+
+- Tab: next dimension
+- ←/→ or ↑/↓: ±1 (Shift = ×10)
+- PgUp/PgDn: ±10 (Shift = ×100)
+- Home/End: min/max
+- Esc/q: quit
+
+Notes:
+- Plotting is only supported in the default mode (`zarr-dump STORE --plot ...`).
+- `-c/--coordinate-data` is not supported together with `--plot`.
+
+## Example output (abridged)
+
+```text
 Opening Zarr store: ./climate_data/
-Consolidated metadata not found: No consolidated metadata found at './climate_data/.zmetadata'.
-Falling back to hierarchical scanning...
-netcdf store {
+zarr store {
 dimensions:
     lat = 180 ;
-    level = 50 ;
     lon = 360 ;
-    record = UNLIMITED ; // (0 currently)
     time = 365 ;
-    x = 100 ;
 variables:
-    float pressure(time, level, lat, lon) ;
-        pressure:_ARRAY_DIMENSIONS = ["time", "level", "lat", "lon"] ;
-        pressure:long_name = "Atmospheric Pressure" ;
-        pressure:standard_name = "air_pressure" ;
-        pressure:units = "hPa" ;
     float temperature(time, lat, lon) ;
-        temperature:_ARRAY_DIMENSIONS = ["time", "lat", "lon"] ;
-        temperature:long_name = "Air Temperature" ;
         temperature:standard_name = "air_temperature" ;
-        temperature:units = "degrees_C" ;
-    double unlimited_var(record, x) ;
-        unlimited_var:_ARRAY_DIMENSIONS = ["record", "x"] ;
-        unlimited_var:long_name = "Unlimited Variable" ;
-        unlimited_var:units = "dimensionless" ;
+        temperature:units = "K" ;
 // global attributes:
-    :conventions = "CF-1.7" ;
-    :history = "Created for demonstration" ;
-    :institution = "Research Institute" ;
-    :source = "Climate Model v2.1" ;
-    :title = "Sample Climate Dataset" ;
+    :Conventions = "CF-1.8" ;
+// CF summary:
+    // Conventions: CF-1.8
+    // Axes:
+    //   T: time (dims 'time')
+    //   Y: lat (dims 'lat')
+    //   X: lon (dims 'lon')
+    // Suggested plot dims: lat,lon
+    // Suggested slice dims: time
+    // Candidate data variables: temperature
 }
 ```
-
-### Example: Consolidated Metadata Store
-
-For stores with consolidated metadata (faster loading):
-
-```bash
-zarr-dump ./consolidated_data/
-```
-
-Output:
-```
-Opening Zarr store: ./consolidated_data/
-Loaded consolidated metadata from .zmetadata
-netcdf store {
-dimensions:
-    lat = 180 ;
-    lon = 360 ;
-    time = 365 ;
-variables:
-    float temperature(time, lat, lon) ;
-        temperature:_ARRAY_DIMENSIONS = ["time", "lat", "lon"] ;
-        temperature:long_name = "Daily Temperature" ;
-        temperature:units = "degrees_C" ;
-// global attributes:
-    :created = "2024-01-15" ;
-    :institution = "Climate Research Center" ;
-    :title = "Consolidated Climate Dataset" ;
-}
-```
-
-### Understanding the Output
-
-- **Dimensions**: Lists all dimensions found across arrays, with unlimited dimensions marked as `UNLIMITED`
-- **Variables**: Shows each array with its data type, dimensions, and attributes
-- **Global Attributes**: Displays store-level metadata
-
-### Unlimited Dimensions
-
-The tool automatically detects unlimited dimensions by:
-
-1. Finding dimensions that appear with different sizes across multiple arrays
-2. Identifying dimensions with size 0 (common for record/time dimensions)
 
 ## Supported Zarr Features
 
-### Supported
-
 - Zarr v2 and v3 specifications
-- **v2**: Consolidated metadata (`.zmetadata`) and hierarchical metadata (`.zarray`, `.zattrs`, `.zgroup`)
-- **v3**: Consolidated metadata in `zarr.json` and individual `zarr.json` files per array
-- All standard data types (`float32`, `int64`, `bool`, etc.)
-- Compression settings (zlib, blosc, zstd, etc.)
-- Array attributes and global attributes
-- Dimension inference via `_ARRAY_DIMENSIONS` (v2) or `dimension_names` (v3)
+- **v2**: consolidated metadata (`.zmetadata`) and hierarchical metadata (`.zarray`, `.zattrs`, `.zgroup`)
+- **v3**: `zarr.json` at the root and per-array `zarr.json`
+- Array and global attributes
 - Nested groups
+- Common primitive dtypes (e.g. int/float/bool/strings) and dtype display
+- Compression/filter metadata reporting
 
-### Current Limitations
+## Limitations
 
-- **Remote Stores**: Only local filesystem stores (no S3, HTTP, etc.)
-- **Data Inspection**: Only simple data inspection is supported (coordinate data via `-c`, and 2D slice plotting via `--plot`).
-- **Complex Dtypes**: Basic support for structured dtypes
-
-### Recommendations
-
-- **Use Consolidated Metadata**: For best performance, create consolidated metadata with `zarr.convenience.consolidate_metadata()`
-- **CF Conventions**: Include `_ARRAY_DIMENSIONS` attributes for proper dimension naming
+- Local filesystem stores only (no S3/HTTP/GCS)
+- Data inspection is intentionally limited:
+  - `-c/--coordinate-data` reads and prints 1D coordinate variable values
+  - `--plot` reads and displays a numeric 2D slice
+- Complex/structured dtypes have limited support (especially for data reading)
 
 ## Architecture
 
-### Core Components
+Core modules:
 
-- **`src/main.rs`**: CLI interface and NetCDF-style output formatting
-- **`src/metadata.rs`**: Internal metadata structures and parsing
-- **`src/store.rs`**: Zarr store interface with consolidated/hierarchical reading
-- **`tests/cli.rs`**: Integration tests with sample stores
-
-### Metadata Loading Strategy
-
-1. **Format Detection**: Check for `zarr.json` (v3) or `.zmetadata` (v2) at root
-2. **Primary**: Attempt to read consolidated metadata from `zarr.json` or `.zmetadata`
-3. **Fallback**: Hierarchical scan of individual metadata files (`.zarray`/`.zattrs`/`.zgroup` for v2, or `zarr.json` for v3)
-4. **Dimension Inference**: Build dimension map from `_ARRAY_DIMENSIONS` (v2) or `dimension_names` (v3) attributes
-5. **Output**: Format in familiar NetCDF `ncdump` style
+- `src/main.rs`: CLI and formatting (`NetCdfFormatter`)
+- `src/store.rs`: metadata loading (consolidated + hierarchical fallback) and data reads used by `-c`/plotting
+- `src/metadata.rs`: internal metadata structures and dimension inference
+- `src/cf.rs`: CF summary + `cf-check` implementation
+- `src/plot.rs` and `src/visualize.rs`: 2D slice plotting + navigation
 
 ## Development
 
-### Running Tests
-
 ```bash
-# Run all tests
+# Run tests
 cargo test
 
-# Run with output
-cargo test -- --nocapture
+# Format
+cargo fmt
 
-# Test specific functionality
-cargo test test_cli_with_hierarchical_store
+# Lint
+cargo clippy -- -D warnings
 ```
-
-### Creating Test Stores
-
-See `tests/cli.rs` for examples of creating test Zarr stores programmatically.
-
-## Contributing
-
-Contributions welcome! Areas for improvement:
-
-- Remote store support (S3, HTTP)
-- Performance optimizations
-- Additional output formats
 
 ## License
 
